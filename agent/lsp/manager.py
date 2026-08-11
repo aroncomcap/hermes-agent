@@ -59,6 +59,7 @@ from agent.lsp.workspace import (
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+DEFAULT_BROKEN_TTL = 120.0  # seconds; _broken expires so a failed cold start is not permanent
 
 
 class _BackgroundLoop:
@@ -116,6 +117,22 @@ class _BackgroundLoop:
             fut.cancel()
             raise
 
+    def schedule(self, coro):
+        """Fire-and-forget a coroutine onto the loop from any thread.
+
+        Returns the :class:`concurrent.futures.Future` (so callers can
+        cancel it) or ``None`` if the loop is not running.  Keeps the real
+        asyncio loop private to this class rather than having callers reach
+        into ``self._loop``.
+        """
+        from agent.async_utils import safe_schedule_threadsafe
+        return safe_schedule_threadsafe(
+            coro,
+            self._loop,
+            logger=logger,
+            log_message="failed to schedule LSP background task",
+        )
+
     def stop(self) -> None:
         loop = self._loop
         if loop is None:
@@ -172,9 +189,17 @@ class LSPService:
 
         # Per-(server_id, workspace_root) state
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
-        self._broken: set = set()
+        # key -> unix time when the broken latch expires.  Was a permanent
+        # set cleared only in _shutdown_async (COM-8386 / Sol REJECT): a
+        # mis-timed post-reap cold start permanently disabled intelligence
+        # for that workspace until the gateway process died.
+        self._broken: Dict[Tuple[str, str], float] = {}
+        self._broken_ttl = float(DEFAULT_BROKEN_TTL)
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        # In-flight hand-outs: reaper must not shut down a client that
+        # _get_or_spawn already returned to a caller awaiting outside the lock.
+        self._in_use: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
 
         # Delta baseline: file path → snapshot of diagnostics taken
@@ -182,6 +207,39 @@ class LSPService:
         # out anything in the baseline so the agent only sees errors
         # introduced by the current edit.
         self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Idle reaper — end of __init__ only, after state dicts exist.
+        self._reaper_interval = max(1.0, min(60.0, float(self._idle_timeout) / 4.0))
+        self._reaper_future = None
+        if self._enabled and self._idle_timeout and self._idle_timeout > 0:
+            self._reaper_future = self._loop.schedule(self._idle_reaper_loop())
+
+    def _is_broken(self, key: Tuple[str, str]) -> bool:
+        """True if key is still inside its broken TTL. Expired entries drop."""
+        until = self._broken.get(key)
+        if until is None:
+            return False
+        if time.time() >= until:
+            self._broken.pop(key, None)
+            return False
+        return True
+
+    def _mark_broken_key(self, key: Tuple[str, str]) -> None:
+        self._broken[key] = time.time() + self._broken_ttl
+
+    def _acquire_client(self, key: Tuple[str, str], client: "LSPClient") -> "LSPClient":
+        """Bump last-used + in-use under the lock; caller must _release_client."""
+        self._last_used[key] = time.time()
+        self._in_use[key] = self._in_use.get(key, 0) + 1
+        return client
+
+    def _release_client(self, key: Tuple[str, str]) -> None:
+        with self._state_lock:
+            n = self._in_use.get(key, 0) - 1
+            if n <= 0:
+                self._in_use.pop(key, None)
+            else:
+                self._in_use[key] = n
 
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
@@ -411,8 +469,8 @@ class LSPService:
         except Exception:  # noqa: BLE001
             per_server_root = ws_root
         key = (srv.server_id, per_server_root)
-        already_broken = key in self._broken
-        self._broken.add(key)
+        already_broken = self._is_broken(key)
+        self._mark_broken_key(key)
 
         # Kill any client we managed to spawn before the timeout.  The
         # cancelled future never reached the broken-set add inside
@@ -435,6 +493,13 @@ class LSPService:
         """Tear down all clients and stop the background loop."""
         if not self._enabled:
             return
+        fut = self._reaper_future
+        self._reaper_future = None
+        if fut is not None:
+            try:
+                fut.cancel()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self._loop.run(self._shutdown_async(), timeout=10.0)
         except Exception as e:  # noqa: BLE001
@@ -450,28 +515,34 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        key = (client.server_id, client.workspace_root)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
+            self._last_used[key] = time.time()
+            return list(client.diagnostics_for(file_path))
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
-        return list(client.diagnostics_for(file_path))
+        finally:
+            self._release_client(key)
 
     async def _open_and_wait_async(self, file_path: str) -> List[Dict[str, Any]]:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        key = (client.server_id, client.workspace_root)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             await client.save_file(file_path)
             await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
+            self._last_used[key] = time.time()
+            return list(client.diagnostics_for(file_path))
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
-        return list(client.diagnostics_for(file_path))
+        finally:
+            self._release_client(key)
 
     async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
         ws, gated = resolve_workspace_for_file(file_path)
@@ -503,19 +574,26 @@ class LSPService:
             return None  # exclude marker hit, server gated off
 
         key = (srv.server_id, per_server_root)
-        if key in self._broken:
+        if self._is_broken(key):
             return None
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
                 eventlog.log_active(srv.server_id, per_server_root)
-                return client
+                return self._acquire_client(key, client)
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                client = await spawning
             except Exception:  # noqa: BLE001
                 return None
+            if client is None:
+                return None
+            # Waiters must take an in-use slot too — the spawner only acquired once.
+            with self._state_lock:
+                if client is self._clients.get(key) and client.is_running:
+                    return self._acquire_client(key, client)
+            return None
 
         # Begin spawn
         loop = asyncio.get_running_loop()
@@ -537,7 +615,7 @@ class LSPService:
                 # or install attempt failed).  Surface this once via
                 # the structured logger so the user can act on it.
                 eventlog.log_server_unavailable(srv.server_id, srv.server_id)
-                self._broken.add(key)
+                self._mark_broken_key(key)
                 spawn_future.set_result(None)
                 return None
             client = LSPClient(
@@ -553,18 +631,104 @@ class LSPService:
                 await client.start()
             except Exception as e:  # noqa: BLE001
                 eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
-                self._broken.add(key)
+                self._mark_broken_key(key)
                 spawn_future.set_result(None)
                 return None
             with self._state_lock:
                 self._clients[key] = client
-            self._last_used[key] = time.time()
+                acquired = self._acquire_client(key, client)
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
-            return client
+            return acquired
         finally:
             with self._state_lock:
                 self._spawning.pop(key, None)
+
+
+    async def _idle_reaper_loop(self) -> None:
+        """Periodically shut down clients idle longer than the timeout.
+
+        Crash-proof: CancelledError re-raises; any other exception is logged
+        and the loop continues so a single failure cannot silently retire the
+        reaper (recreating the original dead-code defect).
+        """
+        interval = self._reaper_interval
+        logger.info(
+            "lsp-idle-reap starting: idle_timeout=%.1fs poll_interval=%.1fs broken_ttl=%.1fs",
+            self._idle_timeout,
+            interval,
+            self._broken_ttl,
+        )
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._reap_idle_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "lsp-idle-reap iteration failed (loop continues): %s", e,
+                    exc_info=True,
+                )
+
+    async def _reap_idle_once(self) -> None:
+        """One reap pass. Never holds ``_state_lock`` across an await."""
+        timeout = self._idle_timeout
+        if not timeout or timeout <= 0:
+            return
+        now = time.time()
+        doomed: List[Tuple[Tuple[str, str], LSPClient, float]] = []
+        with self._state_lock:
+            # Drop expired broken latches opportunistically.
+            for k, until in list(self._broken.items()):
+                if now >= until:
+                    self._broken.pop(k, None)
+
+            for key in list(self._clients.keys()):
+                if key in self._spawning:
+                    continue
+                # Do not reap a client currently handed out to a caller.
+                if self._in_use.get(key, 0) > 0:
+                    continue
+                last = self._last_used.get(key)
+                if last is None:
+                    self._last_used[key] = now
+                    continue
+                idle = now - last
+                if idle < timeout:
+                    continue
+                client = self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+                if client is not None:
+                    doomed.append((key, client, idle))
+
+            for stale in [k for k in self._last_used if k not in self._clients]:
+                if stale in self._spawning or self._in_use.get(stale, 0) > 0:
+                    continue
+                self._last_used.pop(stale, None)
+
+            remaining = len(self._clients)
+
+        if not doomed:
+            return
+
+        results = await asyncio.gather(
+            *(c.shutdown() for _, c, _ in doomed),
+            return_exceptions=True,
+        )
+        for (key, _client, idle), res in zip(doomed, results):
+            if isinstance(res, BaseException):
+                logger.warning(
+                    "lsp-idle-reap FAILED server_id=%s workspace_root=%s "
+                    "idle_s=%.1f remaining_clients=%d err=%s",
+                    key[0], key[1], idle, remaining, res,
+                )
+            else:
+                logger.info(
+                    "lsp-idle-reap server_id=%s workspace_root=%s "
+                    "idle_s=%.1f remaining_clients=%d",
+                    key[0], key[1], idle, remaining,
+                )
 
     async def _shutdown_async(self) -> None:
         with self._state_lock:
@@ -572,6 +736,7 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._in_use.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,
@@ -593,7 +758,7 @@ class LSPService:
                 }
                 for k, c in self._clients.items()
             ]
-            broken = list(self._broken)
+            broken = [k for k, until in self._broken.items() if time.time() < until]
         return {
             "enabled": self._enabled,
             "wait_mode": self._wait_mode,
