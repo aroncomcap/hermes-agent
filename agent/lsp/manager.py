@@ -60,6 +60,12 @@ logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 DEFAULT_BROKEN_TTL = 120.0  # seconds; _broken expires so a failed cold start is not permanent
+# COM-8387: simultaneous-cardinality admission. Idle reap (COM-8386) only bounds
+# accumulation over time; two legitimately active roots still OOM the gateway.
+# Defaults match mercury's observed envelope (gateway ~1GB + one ~2GB stack near
+# MemoryHigh=3.5GiB): at most two stacks, ~2.2GB combined RSS for LSP children.
+DEFAULT_MAX_LSP_CLIENTS = 2
+DEFAULT_LSP_MEMORY_BUDGET_BYTES = int(2.2 * 1024**3)
 
 
 class _BackgroundLoop:
@@ -172,6 +178,8 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_clients: int = DEFAULT_MAX_LSP_CLIENTS,
+        memory_budget_bytes: int = DEFAULT_LSP_MEMORY_BUDGET_BYTES,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -182,6 +190,8 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._max_clients = max(1, int(max_clients)) if max_clients else 0  # 0 = unlimited
+        self._memory_budget_bytes = max(0, int(memory_budget_bytes))  # 0 = unlimited
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -241,6 +251,132 @@ class LSPService:
             else:
                 self._in_use[key] = n
 
+    @staticmethod
+    def _rss_bytes_for_pid(pid: int) -> int:
+        """Best-effort RSS for a process and its children (Linux /proc)."""
+        total = 0
+        try:
+            # Parent
+            with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        # kB
+                        total += int(line.split()[1]) * 1024
+                        break
+        except (OSError, ValueError):
+            return 0
+        # Children (one level + recurse via tasks that list children)
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["ps", "--no-headers", "-o", "pid", "--ppid", str(pid)],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    total += LSPService._rss_bytes_for_pid(int(line))
+        except Exception:  # noqa: BLE001
+            pass
+        return total
+
+    def _client_rss_bytes(self, client: "LSPClient") -> int:
+        proc = getattr(client, "_proc", None)
+        pid = getattr(proc, "pid", None) if proc is not None else None
+        if not pid:
+            return 0
+        return self._rss_bytes_for_pid(int(pid))
+
+    def _total_lsp_rss_bytes_unlocked(self) -> int:
+        return sum(self._client_rss_bytes(c) for c in self._clients.values())
+
+    def _over_budget_unlocked(self) -> bool:
+        if self._max_clients and len(self._clients) >= self._max_clients:
+            return True
+        if self._memory_budget_bytes and self._total_lsp_rss_bytes_unlocked() >= self._memory_budget_bytes:
+            return True
+        return False
+
+    def _pick_eviction_candidate_unlocked(
+        self, exclude: Optional[Tuple[str, str]] = None,
+    ) -> Optional[Tuple[str, str]]:
+        """LRU among clients not in-use and not mid-spawn."""
+        now = time.time()
+        best_key = None
+        best_idle = -1.0
+        for key, client in self._clients.items():
+            if exclude is not None and key == exclude:
+                continue
+            if key in self._spawning:
+                continue
+            if self._in_use.get(key, 0) > 0:
+                continue
+            if not getattr(client, "is_running", False):
+                # Prefer dead clients immediately
+                return key
+            last = self._last_used.get(key, 0.0)
+            idle = now - last
+            if idle > best_idle:
+                best_idle = idle
+                best_key = key
+        return best_key
+
+    async def _admit_for_spawn(self, new_key: Tuple[str, str]) -> bool:
+        """Ensure room for a new client. Evict LRU idle stacks; deny if all busy.
+
+        Returns True if spawn may proceed. Never holds the lock across await.
+        """
+        doomed: List[Tuple[Tuple[str, str], LSPClient]] = []
+        with self._state_lock:
+            # Already have this key (race) — no admission needed.
+            existing = self._clients.get(new_key)
+            if existing is not None and existing.is_running:
+                return True
+
+            # Evict until under budget or no candidate.
+            # Cap iterations so a pathological loop cannot spin forever.
+            for _ in range(max(8, len(self._clients) + 2)):
+                if not self._over_budget_unlocked():
+                    break
+                # If we are under max_clients count but over memory, still evict.
+                cand = self._pick_eviction_candidate_unlocked(exclude=new_key)
+                if cand is None:
+                    # All remaining clients are in active use — refuse spawn so
+                    # the gateway control plane keeps its reserve (COM-8387).
+                    n = len(self._clients)
+                    rss = self._total_lsp_rss_bytes_unlocked()
+                    logger.warning(
+                        "lsp-admission DENY server_id=%s workspace_root=%s "
+                        "clients=%d rss_bytes=%d max_clients=%d budget_bytes=%d "
+                        "(all clients in use; degrade tooling, protect gateway)",
+                        new_key[0], new_key[1], n, rss,
+                        self._max_clients, self._memory_budget_bytes,
+                    )
+                    return False
+                client = self._clients.pop(cand, None)
+                self._last_used.pop(cand, None)
+                if client is not None:
+                    doomed.append((cand, client))
+                    logger.info(
+                        "lsp-admission EVICT server_id=%s workspace_root=%s "
+                        "to admit server_id=%s workspace_root=%s",
+                        cand[0], cand[1], new_key[0], new_key[1],
+                    )
+
+        if doomed:
+            results = await asyncio.gather(
+                *(c.shutdown() for _, c in doomed),
+                return_exceptions=True,
+            )
+            for (key, _c), res in zip(doomed, results):
+                if isinstance(res, BaseException):
+                    logger.warning(
+                        "lsp-admission EVICT shutdown failed %s/%s: %s",
+                        key[0], key[1], res,
+                    )
+        return True
+
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
         """Build a service from ``hermes_cli.config`` settings.
@@ -284,6 +420,18 @@ class LSPService:
                 if isinstance(init, dict):
                     init_overrides[name] = init
 
+        idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
+        max_clients = int(lsp_cfg.get("max_clients", DEFAULT_MAX_LSP_CLIENTS))
+        mem_budget = lsp_cfg.get("memory_budget_bytes", DEFAULT_LSP_MEMORY_BUDGET_BYTES)
+        memory_budget_bytes = int(mem_budget)
+
+        # Soft per-process cap for tsserver — secondary to multi-root admission
+        # (reviewers: not sufficient alone). Only fill if caller did not set it.
+        ts_init = init_overrides.setdefault("typescript", {})
+        if isinstance(ts_init, dict) and "maxTsServerMemory" not in ts_init:
+            # MB. ~1536 keeps a single stack under the multi-root budget envelope.
+            ts_init["maxTsServerMemory"] = int(lsp_cfg.get("max_ts_server_memory_mb", 1536))
+
         return cls(
             enabled=enabled,
             wait_mode=wait_mode,
@@ -293,6 +441,9 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            idle_timeout=idle_timeout,
+            max_clients=max_clients,
+            memory_budget_bytes=memory_budget_bytes,
         )
 
     # ------------------------------------------------------------------
@@ -595,6 +746,15 @@ class LSPService:
                     return self._acquire_client(key, client)
             return None
 
+        # COM-8387 admission: evict idle peers or refuse before a second large
+        # root can push the gateway cgroup into reclaim.
+        if not await self._admit_for_spawn(key):
+            eventlog.log_disabled(
+                srv.server_id, file_path,
+                "admission denied (max clients / memory budget; all in use)",
+            )
+            return None
+
         # Begin spawn
         loop = asyncio.get_running_loop()
         spawn_future: asyncio.Future = loop.create_future()
@@ -759,6 +919,8 @@ class LSPService:
                 for k, c in self._clients.items()
             ]
             broken = [k for k, until in self._broken.items() if time.time() < until]
+            rss = self._total_lsp_rss_bytes_unlocked()
+            in_use = dict(self._in_use)
         return {
             "enabled": self._enabled,
             "wait_mode": self._wait_mode,
@@ -767,6 +929,10 @@ class LSPService:
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),
+            "max_clients": self._max_clients,
+            "memory_budget_bytes": self._memory_budget_bytes,
+            "lsp_rss_bytes": rss,
+            "in_use": {f"{k[0]}|{k[1]}": v for k, v in in_use.items()},
         }
 
 

@@ -3123,6 +3123,18 @@ DEFAULT_CONFIG = {
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
 
+        # Idle reap (COM-8386). Seconds; 0 disables the reaper.
+        "idle_timeout": 600,
+
+        # Simultaneous-cardinality admission (COM-8387). Idle reap alone
+        # cannot help when 2+ roots are legitimately active. max_clients=0
+        # or memory_budget_bytes=0 means unlimited for that dimension.
+        "max_clients": 2,
+        "memory_budget_bytes": 2362232012,  # int(2.2 * 1024**3)
+        # Soft tsserver heap cap (MB) via initializationOptions — not a
+        # substitute for multi-root admission.
+        "max_ts_server_memory_mb": 1536,
+
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:
