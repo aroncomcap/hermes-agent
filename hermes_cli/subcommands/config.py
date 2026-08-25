@@ -46,4 +46,26 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     # config migrate
     config_subparsers.add_parser("migrate", help="Update config with new options")
 
+    # config diff
+    config_diff = config_subparsers.add_parser(
+        "diff", help="Show how the current config differs from defaults"
+    )
+    config_diff.add_argument(
+        "--json", action="store_true", help="Output as JSON instead of text"
+    )
+
+    # config validate
+    config_validate = config_subparsers.add_parser(
+        "validate",
+        help="Validate config.yaml structure/values (exits non-zero on errors)",
+    )
+    config_validate.add_argument(
+        "--json", action="store_true", help="Output as JSON instead of text"
+    )
+
+    # config overrides
+    config_subparsers.add_parser(
+        "overrides", help="List active HERMES_CFG__* env var overrides"
+    )
+
     config_parser.set_defaults(func=cmd_config)
