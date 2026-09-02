@@ -5421,8 +5421,7 @@ def diff_config_from_defaults(config: Optional[Dict[str, Any]] = None) -> List[D
     different value (``status="changed"``). Powers ``hermes config diff``.
 
     ``config`` is the *effective* config (``load_config()``'s result) by
-    default, so the diff reflects env-var overrides (see
-    ``apply_env_overrides``) and managed-scope values too, not just the raw
+    default, so the diff reflects managed-scope values too, not just the raw
     config.yaml on disk.
     """
     if config is None:
@@ -5432,10 +5431,10 @@ def diff_config_from_defaults(config: Optional[Dict[str, Any]] = None) -> List[D
 
     def _walk(defaults: Any, current: Any, prefix: str) -> None:
         if isinstance(defaults, dict) and isinstance(current, dict):
-            for key in sorted(set(defaults) | set(current)):
+            for key in sorted(set(defaults) | set(current), key=str):
                 if isinstance(key, str) and key.startswith("_"):
                     continue
-                full_key = key if not prefix else f"{prefix}.{key}"
+                full_key = str(key) if not prefix else f"{prefix}.{key}"
                 has_default = key in defaults
                 has_current = key in current
                 if has_default and not has_current:
@@ -5497,89 +5496,21 @@ def print_config_diff(diffs: List[Dict[str, Any]]) -> None:
     print()
 
 
-# ── Env-based config overrides (HERMES_CFG__*) ───────────────────────────────
-# Non-secret runtime overrides: flip a config.yaml value from the shell/CI/
-# container env without editing the file. Path segments join on a double
-# underscore (a single underscore is legal inside key names, e.g.
-# ``max_turns``), e.g.:
-#
-#   HERMES_CFG__model=anthropic/claude-sonnet-4
-#   HERMES_CFG__agent__max_turns=50
-#   HERMES_CFG__gateway__platform_connect_timeout=60
-#
-# Precedence: config.yaml < HERMES_CFG__* < managed scope. Managed scope is
-# an administrator lockdown layer (docs/design/managed-scope.md §4.1) and
-# must keep winning over an operator's own env var, so overrides are folded
-# in *before* the managed-scope merge in ``_load_config_impl`` — see
-# ``load_config()`` below, which applies them as a post-cache overlay rather
-# than touching that function's cache-signature invariants directly.
-_ENV_OVERRIDE_PREFIX = "HERMES_CFG__"
+def redact_config_diffs(diffs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Redact diff values using the leaf config key as credential context."""
+    redacted = []
+    for diff in diffs:
+        leaf_key = str(diff["key"]).rsplit(".", 1)[-1]
 
+        def _redact(value: Any) -> Any:
+            return redact_config_value({leaf_key: value})[leaf_key]
 
-def get_active_env_overrides() -> Dict[str, str]:
-    """Return the currently set ``HERMES_CFG__*`` env vars, prefix stripped to dotted path."""
-    return {
-        k[len(_ENV_OVERRIDE_PREFIX):].replace("__", "."): v
-        for k, v in os.environ.items()
-        if k.startswith(_ENV_OVERRIDE_PREFIX) and k != _ENV_OVERRIDE_PREFIX
-    }
-
-
-def _coerce_env_override_value(raw: str, current: Any) -> Any:
-    """Coerce a ``HERMES_CFG__*`` env var string to match the target field's type.
-
-    Mirrors config.yaml's own scalar parsing (YAML-safe-load) so
-    ``HERMES_CFG__agent__max_turns=50`` behaves the same as writing
-    ``max_turns: 50`` in config.yaml, whether or not the key already exists
-    in ``DEFAULT_CONFIG``.
-    """
-    try:
-        parsed = yaml.safe_load(raw)
-    except Exception:
-        return raw
-    if current is not None and not isinstance(current, (dict, list)):
-        target_type = type(current)
-        if target_type is bool:
-            if isinstance(parsed, bool):
-                return parsed
-            return raw.strip().lower() in {"1", "true", "yes", "on"}
-        if target_type in (int, float) and isinstance(parsed, (int, float)):
-            return target_type(parsed)
-    return parsed
-
-
-def apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply ``HERMES_CFG__section__key=value`` env var overrides on top of *config*.
-
-    Returns *config* unchanged (same object, no copy) when no override env
-    vars are set — the common case — so callers on a hot path (e.g.
-    ``load_config_readonly()``) pay nothing when the feature isn't in use.
-    When overrides are present, returns a new dict; *config* is not mutated.
-    Unknown paths are still applied (creating the nested structure) so new
-    config keys don't need this function updated.
-    """
-    overrides = get_active_env_overrides()
-    if not overrides:
-        return config
-
-    result = copy.deepcopy(config)
-    for dotted_path, raw_value in overrides.items():
-        path = [p for p in dotted_path.split(".") if p]
-        if not path:
-            continue
-        node = result
-        for segment in path[:-1]:
-            nxt = node.get(segment) if isinstance(node, dict) else None
-            if not isinstance(nxt, dict):
-                nxt = {}
-                node[segment] = nxt
-            node = nxt
-        leaf = path[-1]
-        if not isinstance(node, dict):
-            continue
-        current = node.get(leaf)
-        node[leaf] = _coerce_env_override_value(raw_value, current)
-    return result
+        redacted.append({
+            **diff,
+            "default": _redact(diff["default"]),
+            "current": _redact(diff["current"]),
+        })
+    return redacted
 
 
 def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> None:
@@ -6931,13 +6862,8 @@ def load_config() -> Dict[str, Any]:
     Read-only callers should use ``load_config_readonly()`` to skip the
     defensive deepcopy — that path matters in agent-loop hot spots like
     ``get_provider_request_timeout`` which is called once per API turn.
-
-    Applies any ``HERMES_CFG__*`` env var overrides on top of the cached
-    result (see ``apply_env_overrides``) — a thin overlay, not part of the
-    cache signature, so it's always evaluated fresh against the current
-    environment.
     """
-    return apply_env_overrides(_load_config_impl(want_deepcopy=True))
+    return _load_config_impl(want_deepcopy=True)
 
 
 def load_config_readonly() -> Dict[str, Any]:
@@ -6959,14 +6885,8 @@ def load_config_readonly() -> Dict[str, Any]:
     Note: this returns a plain ``dict`` (not ``MappingProxyType``) so
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
-
-    ``apply_env_overrides()`` is a no-op (returns the same object, no copy)
-    when no ``HERMES_CFG__*`` env var is set, which preserves this
-    function's zero-deepcopy contract in the common case. When an override
-    *is* set, the result is a freshly-built dict distinct from the shared
-    cache, so it's safe to return even though it wasn't deepcopied from it.
     """
-    return apply_env_overrides(_load_config_impl(want_deepcopy=False))
+    return _load_config_impl(want_deepcopy=False)
 
 
 def write_platform_config_field(
@@ -8512,10 +8432,7 @@ def config_command(args):
         print()
 
     elif subcmd == "diff":
-        diffs = [
-            {**d, "default": redact_config_value(d["default"]), "current": redact_config_value(d["current"])}
-            for d in diff_config_from_defaults()
-        ]
+        diffs = redact_config_diffs(diff_config_from_defaults())
         if getattr(args, "json", False):
             print(json.dumps(diffs, indent=2, default=str))
         else:
@@ -8553,25 +8470,6 @@ def config_command(args):
         if any(i.severity == "error" for i in issues):
             sys.exit(1)
 
-    elif subcmd == "overrides":
-        overrides = get_active_env_overrides()
-        if getattr(args, "json", False):
-            print(json.dumps(overrides, indent=2))
-        else:
-            print()
-            print(color("📋 Active Env Overrides", Colors.CYAN, Colors.BOLD))
-            print()
-            if not overrides:
-                print(color("  (none set)", Colors.DIM))
-                print()
-                print("  Set HERMES_CFG__<section>__<key>=<value> to override a config.yaml")
-                print("  value at runtime without editing the file, e.g.:")
-                print("    HERMES_CFG__agent__max_turns=50 hermes chat")
-            else:
-                for dotted_key, raw_value in sorted(overrides.items()):
-                    print(f"    {dotted_key} = {raw_value}")
-            print()
-
     else:
         print(f"Unknown config command: {subcmd}")
         print()
@@ -8582,7 +8480,6 @@ def config_command(args):
         print("  hermes config check       Check for missing/outdated config")
         print("  hermes config validate    Validate config.yaml structure/values")
         print("  hermes config diff        Show how current config differs from defaults")
-        print("  hermes config overrides   List active HERMES_CFG__* env overrides")
         print("  hermes config migrate     Update config with new options")
         print("  hermes config path        Show config file path")
         print("  hermes config env-path    Show .env file path")

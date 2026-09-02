@@ -63,9 +63,4 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
         "--json", action="store_true", help="Output as JSON instead of text"
     )
 
-    # config overrides
-    config_subparsers.add_parser(
-        "overrides", help="List active HERMES_CFG__* env var overrides"
-    )
-
     config_parser.set_defaults(func=cmd_config)

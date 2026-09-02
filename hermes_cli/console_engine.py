@@ -766,7 +766,7 @@ class HermesConsoleEngine:
                 "hermes_cli.subcommands.config",
                 "build_config_parser",
                 "cmd_config",
-                [("env-path",), ("check",), ("diff",), ("validate",), ("overrides",)],
+                [("env-path",), ("check",), ("diff",), ("validate",)],
                 set(),
             ),
             "tools": (
