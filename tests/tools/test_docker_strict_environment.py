@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools.environments import docker as docker_env
+from tools.environments.base import BaseEnvironment
 from tools import terminal_tool
 from scripts import rehearse_strict_docker
 
@@ -32,6 +33,50 @@ def test_strict_mount_allowlist_is_canonical_and_closed(tmp_path):
         {"source": str(runtime.resolve()), "target": "/runtime", "mode": "ro"},
         {"source": str(workspace.resolve()), "target": "/workspace", "mode": "rw"},
     ]
+
+
+@pytest.mark.parametrize("layout", ["same", "workspace_parent", "runtime_parent"])
+def test_strict_mount_allowlist_rejects_rw_ro_source_overlap(tmp_path, layout):
+    workspace = _workspace(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    if layout == "same":
+        runtime = workspace
+    elif layout == "workspace_parent":
+        runtime = workspace / "runtime"
+        runtime.mkdir()
+    elif layout == "runtime_parent":
+        runtime = tmp_path
+
+    with pytest.raises(ValueError, match="may not overlap"):
+        docker_env._normalize_strict_mounts([
+            {"source": str(workspace), "target": "/workspace", "mode": "rw"},
+            {"source": str(runtime), "target": "/runtime", "mode": "ro"},
+        ])
+
+
+class _InitFailureEnvironment(BaseEnvironment):
+    def _run_bash(self, *args, **kwargs):
+        raise RuntimeError("inspection failed")
+
+    def cleanup(self):
+        return None
+
+
+def test_init_session_can_propagate_for_strict_backends():
+    env = _InitFailureEnvironment(cwd="/workspace", timeout=1)
+    env._propagate_init_session_errors = True
+
+    with pytest.raises(RuntimeError, match="inspection failed"):
+        env.init_session()
+
+
+def test_init_session_preserves_non_strict_fallback():
+    env = _InitFailureEnvironment(cwd="/workspace", timeout=1)
+
+    env.init_session()
+
+    assert env._snapshot_ready is False
 
 
 @pytest.mark.parametrize(
@@ -159,6 +204,32 @@ def test_strict_mode_fails_before_create_on_rootful_daemon(monkeypatch, tmp_path
             }],
         )
     assert lifecycle_calls == []
+
+
+@pytest.mark.parametrize(
+    "user_spec", ["1000", "user:1000", "1000:root", "0:1000", "1000:0", "0:0"]
+)
+def test_strict_mode_requires_exact_non_root_numeric_uid_gid(
+    monkeypatch, tmp_path, user_spec
+):
+    workspace = _workspace(tmp_path)
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: user_spec)
+
+    with pytest.raises(RuntimeError, match="numeric host uid:gid|non-root host uid:gid"):
+        docker_env.DockerEnvironment(
+            image="unused",
+            cwd="/workspace",
+            cpu=1,
+            memory=512,
+            persistent_filesystem=False,
+            network=False,
+            run_as_host_user=True,
+            persist_across_processes=False,
+            strict_mode=True,
+            strict_mounts=[{
+                "source": str(workspace), "target": "/workspace", "mode": "ro",
+            }],
+        )
 
 
 def test_rehearsal_cleanup_waits_for_removal():
@@ -312,6 +383,7 @@ def test_strict_pre_exec_inspection_accepts_exact_identity(monkeypatch, tmp_path
     env._strict_expected_resources = {
         "NanoCpus": 1_000_000_000, "Memory": 536_870_912, "PidsLimit": 256,
     }
+    env._strict_expected_user = "1000:1000"
 
     env._verify_strict_container(require_running=True)
 
@@ -335,6 +407,7 @@ def test_strict_pre_start_requires_created_and_stopped(monkeypatch, tmp_path):
     env._strict_expected_resources = {
         "NanoCpus": 1_000_000_000, "Memory": 536_870_912, "PidsLimit": 256,
     }
+    env._strict_expected_user = "1000:1000"
     env._verify_strict_container(require_running=False)
 
     for state in (
@@ -364,16 +437,24 @@ def test_strict_never_starts_or_execs_before_stopped_inspection(monkeypatch, tmp
         lambda image: pytest.fail("strict mode must not execute the cgroup probe"),
     )
 
+    removed = False
+
     def fake_run(args, **kwargs):
+        nonlocal removed
         commands.append(args)
         if args[1] == "create":
             return SimpleNamespace(stdout="container-id\n", returncode=0)
         if args[1:3] == ["image", "inspect"]:
             return SimpleNamespace(stdout="sha256:image-id\n", returncode=0)
         if args[1] == "inspect":
+            if removed:
+                return SimpleNamespace(stdout="", stderr="No such object", returncode=1)
             return SimpleNamespace(stdout=json.dumps([payload]), returncode=0)
+        if args[1] == "stop":
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if args[1:3] == ["rm", "-f"]:
-            return SimpleNamespace(stdout="", returncode=0)
+            removed = True
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         pytest.fail(f"unexpected lifecycle command: {args}")
 
     monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
@@ -417,20 +498,26 @@ def test_strict_revalidates_mounts_before_create_and_start(monkeypatch, tmp_path
         lambda self: events.append("revalidate"),
     )
 
+    removed = False
+
     def fake_run(args, **kwargs):
+        nonlocal removed
         events.append(args[1])
         if args[1] == "create":
             return SimpleNamespace(stdout="container-id\n", returncode=0)
         if args[1:3] == ["image", "inspect"]:
             return SimpleNamespace(stdout="sha256:image-id\n", returncode=0)
         if args[1] == "inspect":
+            if removed:
+                return SimpleNamespace(stdout="", stderr="No such container", returncode=1)
             return SimpleNamespace(stdout=json.dumps([payload]), returncode=0)
         if args[1] == "start":
             return SimpleNamespace(stdout="", returncode=0)
         if args[1] == "stop":
             return SimpleNamespace(stdout="", returncode=0)
         if args[1:3] == ["rm", "-f"]:
-            return SimpleNamespace(stdout="", returncode=0)
+            removed = True
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         pytest.fail(f"unexpected lifecycle command: {args}")
 
     monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
@@ -451,8 +538,152 @@ def test_strict_revalidates_mounts_before_create_and_start(monkeypatch, tmp_path
     assert events.index("revalidate") < events.index("create")
     start_index = events.index("start")
     assert events[start_index - 1] == "revalidate"
+    assert env._strict_expected_user == "1000:1000"
     env.cleanup()
-    env._cleanup_thread.join(timeout=2)
+    assert env._container_id is None
+
+
+def _strict_cleanup_env() -> docker_env.DockerEnvironment:
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._docker_exe = "docker"
+    env._container_id = "container-id"
+    env._strict_mode = True
+    env._persistent = False
+    env._persist_across_processes = False
+    env._workspace_dir = None
+    env._home_dir = None
+    return env
+
+
+def test_strict_cleanup_verifies_absence_before_discarding_handle(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args[1])
+        if args[1] == "inspect":
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such object")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    env = _strict_cleanup_env()
+
+    env.cleanup()
+
+    assert calls == ["stop", "rm", "inspect"]
+    assert env._container_id is None
+
+
+@pytest.mark.parametrize("failed_action", ["stop", "rm"])
+def test_strict_cleanup_propagates_lifecycle_failures_and_retains_handle(
+    monkeypatch, failed_action
+):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args[1])
+        if args[1] == "inspect":
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+        return SimpleNamespace(
+            returncode=1 if args[1] == failed_action else 0,
+            stdout="",
+            stderr="failure",
+        )
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    env = _strict_cleanup_env()
+
+    with pytest.raises(RuntimeError, match=f"docker {failed_action} exited 1"):
+        env.cleanup()
+
+    assert calls == ["stop", "rm", "inspect"]
+    assert env._container_id == "container-id"
+
+
+def test_strict_cleanup_rejects_unverified_absence_and_retains_handle(monkeypatch):
+    def fake_run(args, **kwargs):
+        if args[1] == "inspect":
+            return SimpleNamespace(returncode=1, stdout="", stderr="daemon unavailable")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    env = _strict_cleanup_env()
+
+    with pytest.raises(RuntimeError, match="absence could not be verified"):
+        env.cleanup()
+
+    assert env._container_id == "container-id"
+
+
+def test_strict_cleanup_rejects_container_that_still_exists(monkeypatch):
+    def fake_run(args, **kwargs):
+        if args[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    env = _strict_cleanup_env()
+
+    with pytest.raises(RuntimeError, match="still exists"):
+        env.cleanup()
+
+    assert env._container_id == "container-id"
+
+
+def test_strict_init_failure_triggers_verified_teardown(monkeypatch, tmp_path):
+    workspace = _workspace(tmp_path)
+    payload = _inspect_payload(workspace)
+    payload["Mounts"][0]["Source"] = str(workspace.resolve())
+    payload["State"] = {"Running": False, "Status": "created"}
+    commands = []
+    removed = False
+
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: "1000:1000")
+    monkeypatch.setattr(docker_env, "_ensure_docker_available", lambda: None)
+    monkeypatch.setattr(docker_env, "_rootless_docker_available", lambda: True)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "docker")
+    monkeypatch.setattr(docker_env, "_image_uses_init_entrypoint", lambda *args: False)
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "init_session",
+        lambda self: (_ for _ in ()).throw(RuntimeError("post-start inspection failed")),
+    )
+
+    def fake_run(args, **kwargs):
+        nonlocal removed
+        commands.append(args[1])
+        if args[1] == "create":
+            return SimpleNamespace(stdout="container-id\n", stderr="", returncode=0)
+        if args[1:3] == ["image", "inspect"]:
+            return SimpleNamespace(stdout="sha256:image-id\n", stderr="", returncode=0)
+        if args[1] == "inspect":
+            if removed:
+                return SimpleNamespace(stdout="", stderr="No such object", returncode=1)
+            return SimpleNamespace(stdout=json.dumps([payload]), stderr="", returncode=0)
+        if args[1] in {"start", "stop"}:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if args[1:3] == ["rm", "-f"]:
+            removed = True
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        pytest.fail(f"unexpected lifecycle command: {args}")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="post-start inspection failed"):
+        docker_env.DockerEnvironment(
+            image="strict-image",
+            cwd="/workspace",
+            cpu=1,
+            memory=512,
+            network=False,
+            run_as_host_user=True,
+            persist_across_processes=False,
+            strict_mode=True,
+            strict_mounts=[{
+                "source": str(workspace), "target": "/workspace", "mode": "ro",
+            }],
+        )
+
+    assert commands[-3:] == ["stop", "rm", "inspect"]
 
 
 def test_strict_revalidates_mounts_before_first_exec(monkeypatch):
@@ -490,13 +721,30 @@ def test_strict_mount_race_is_rejected_on_revalidation(tmp_path):
         docker_env.DockerEnvironment._revalidate_strict_mounts(env)
 
 
+def test_strict_mount_overlap_is_rejected_on_revalidation(tmp_path):
+    workspace = _workspace(tmp_path)
+    runtime = workspace / "runtime"
+    runtime.mkdir()
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._strict_mounts = [
+        {"source": str(workspace.resolve()), "target": "/workspace", "mode": "rw"},
+        {"source": str(runtime.resolve()), "target": "/runtime", "mode": "ro"},
+    ]
+
+    with pytest.raises(RuntimeError, match="may not overlap"):
+        env._revalidate_strict_mounts()
+
+
 @pytest.mark.parametrize(
     ("section", "key", "value", "failure"),
     [
         ("HostConfig", "NetworkMode", "bridge", "network mode"),
         ("HostConfig", "CapAdd", ["SYS_ADMIN"], "added capabilities"),
         ("HostConfig", "Memory", 268_435_456, "resource limits"),
-        ("Config", "User", "0:0", "non-root user"),
+        ("Config", "User", "0:0", "user identity"),
+        ("Config", "User", "1001:1000", "user identity"),
+        ("Config", "User", "1000:1001", "user identity"),
+        ("Config", "User", "root:root", "user identity"),
         ("State", "Running", False, "running state"),
     ],
 )
@@ -521,6 +769,7 @@ def test_strict_pre_exec_inspection_fails_closed(
     env._strict_expected_resources = {
         "NanoCpus": 1_000_000_000, "Memory": 536_870_912, "PidsLimit": 256,
     }
+    env._strict_expected_user = "1000:1000"
 
     with pytest.raises(RuntimeError, match=failure):
         env._verify_strict_container(require_running=True)
@@ -560,6 +809,7 @@ def test_strict_pre_exec_inspection_rejects_identity_and_mount_drift(
     env._strict_expected_resources = {
         "NanoCpus": 1_000_000_000, "Memory": 536_870_912, "PidsLimit": 256,
     }
+    env._strict_expected_user = "1000:1000"
 
     with pytest.raises(RuntimeError, match=failure):
         env._verify_strict_container(require_running=True)
