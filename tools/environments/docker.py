@@ -726,6 +726,7 @@ class DockerEnvironment(BaseEnvironment):
         strict_mounts: list[dict[str, str]] | None = None,
         strict_control_source: str | None = None,
         strict_control_lane: str | None = None,
+        strict_control_manifest_digest: str | None = None,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -743,6 +744,8 @@ class DockerEnvironment(BaseEnvironment):
         self._strict_control_bundle: ControlBundle | None = None
         self._strict_control_volume = ""
         self._strict_control_lane = ""
+        self._strict_expected_control_manifest_digest = ""
+        self._strict_helper_label = ""
         self._propagate_init_session_errors = strict_mode
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
@@ -815,7 +818,15 @@ class DockerEnvironment(BaseEnvironment):
                 self._strict_control_bundle = load_control_bundle(
                     strict_control_source, workspace_mount["source"]
                 )
+                if not strict_control_manifest_digest:
+                    raise ValueError("strict control source requires a shared manifest digest")
+                if not re.fullmatch(r"[0-9a-f]{64}", strict_control_manifest_digest):
+                    raise ValueError("strict control manifest digest must be a sha256 hex digest")
+                if self._strict_control_bundle.manifest_digest != strict_control_manifest_digest:
+                    raise ValueError("strict control source manifest does not match shared digest")
+                self._strict_expected_control_manifest_digest = strict_control_manifest_digest
                 self._strict_control_lane = strict_control_lane
+                self._strict_helper_label = uuid.uuid4().hex
                 self._strict_control_volume = (
                     f"hermes-strict-{strict_control_lane}-{uuid.uuid4().hex}"
                 )
@@ -1218,7 +1229,7 @@ class DockerEnvironment(BaseEnvironment):
                             check=True,
                             stdin=subprocess.DEVNULL,
                         )
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, OSError) as e:
                         logger.warning(
                             "Failed to start existing container %s (state=%s): "
                             "%s — falling back to a fresh container.",
@@ -1239,8 +1250,6 @@ class DockerEnvironment(BaseEnvironment):
             init_args = [] if image_uses_s6_init else ["--init"]
             lifecycle_command = "create" if strict_mode else "run"
             lifecycle_args = [] if strict_mode else ["-d"]
-            if strict_mode:
-                self._create_strict_control_volume(image)
             run_cmd = [
                 self._docker_exe, lifecycle_command, *lifecycle_args,
                 *init_args,
@@ -1254,6 +1263,7 @@ class DockerEnvironment(BaseEnvironment):
             logger.debug(f"Starting container: {' '.join(run_cmd)}")
             try:
                 if strict_mode:
+                    self._create_strict_control_volume(image)
                     self._revalidate_strict_mounts()
                 result = subprocess.run(
                     run_cmd,
@@ -1263,7 +1273,7 @@ class DockerEnvironment(BaseEnvironment):
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, OSError) as e:
                 # Docker may create the container object before `docker run`
                 # fails to start it (e.g. exit code 125 when the daemon isn't
                 # ready, or a timeout mid-pull). That orphan is left in
@@ -1357,7 +1367,7 @@ class DockerEnvironment(BaseEnvironment):
         expected_labels = {
             "hermes-strict-control": "1",
             "hermes-strict-lane": self._strict_control_lane,
-            "hermes-strict-manifest": self._strict_control_bundle.manifest_digest,
+            "hermes-strict-manifest": self._strict_expected_control_manifest_digest,
         }
         if (
             info.get("Name") != self._strict_control_volume
@@ -1368,24 +1378,89 @@ class DockerEnvironment(BaseEnvironment):
         ):
             raise RuntimeError("strict control volume identity or driver policy changed")
 
+    def _strict_helper_resource_args(self) -> list[str]:
+        resources = getattr(self, "_strict_expected_resources", {}) or {}
+        args: list[str] = []
+        nano_cpus = int(resources.get("NanoCpus") or 0)
+        if nano_cpus > 0:
+            args.extend(["--cpus", str(nano_cpus / 1_000_000_000).rstrip("0").rstrip(".")])
+        memory = int(resources.get("Memory") or 0)
+        if memory > 0:
+            args.extend(["--memory", f"{memory // (1024 * 1024)}m"])
+        pids = int(resources.get("PidsLimit") or 0)
+        if pids > 0:
+            args.extend(["--pids-limit", str(pids)])
+        return args
+
+    def _strict_helper_base_args(self, name: str) -> list[str]:
+        if not self._strict_expected_control_manifest_digest:
+            raise RuntimeError("strict control helper has no shared manifest digest")
+        return [
+            self._docker_exe, "run", "--name", name,
+            "--label", "hermes-strict-control-helper=1",
+            "--label", f"hermes-strict-helper={self._strict_helper_label}",
+            "--label", f"hermes-strict-lane={self._strict_control_lane}",
+            "--label", f"hermes-strict-manifest={self._strict_expected_control_manifest_digest}",
+            "--network=none",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+            "--tmpfs", "/var/tmp:rw,noexec,nosuid,nodev,size=16m",
+            *self._strict_helper_resource_args(),
+            "--user", "0:0",
+            "--entrypoint", "tar",
+        ]
+
+    def _cleanup_strict_helper_container(self, name: str) -> None:
+        subprocess.run(
+            [self._docker_exe, "rm", "-f", name],
+            capture_output=True, text=True, timeout=30, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        probe = subprocess.run(
+            [self._docker_exe, "inspect", name],
+            capture_output=True, text=True, timeout=30, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0 or "no such" not in (probe.stderr or "").lower():
+            raise RuntimeError("strict control helper residue could not be removed")
+
+    def _run_strict_control_helper(
+        self,
+        image: str,
+        mount_spec: str,
+        tar_args: list[str],
+        *,
+        input_bytes: bytes | None = None,
+    ) -> subprocess.CompletedProcess:
+        name = f"hermes-strict-helper-{uuid.uuid4().hex}"
+        cmd = [*self._strict_helper_base_args(name), "--mount", mount_spec, image, *tar_args]
+        try:
+            return subprocess.run(
+                cmd,
+                input=input_bytes,
+                capture_output=True,
+                timeout=120,
+                check=True,
+                stdin=subprocess.DEVNULL if input_bytes is None else None,
+            )
+        finally:
+            self._cleanup_strict_helper_container(name)
+
     def _verify_strict_control_volume_contents(self, image: str | None = None) -> None:
         """Re-hash the live read-only control volume against the trusted manifest."""
         if not getattr(self, "_strict_control_volume", ""):
             return
         if self._strict_control_bundle is None:
             raise RuntimeError("strict control volume has no trusted bundle")
-        readback = subprocess.run(
-            [
-                self._docker_exe, "run", "--rm", "--network=none",
-                "--user", "0:0", "--entrypoint", "tar",
-                "--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime,readonly",
-                image or self._image, "-C", "/runtime", "-cf", "-", ".",
-            ],
-            capture_output=True, timeout=120, check=True,
-            stdin=subprocess.DEVNULL,
+        readback = self._run_strict_control_helper(
+            image or self._image,
+            f"type=volume,src={self._strict_control_volume},dst=/runtime,readonly",
+            ["-C", "/runtime", "-cf", "-", "."],
         )
         verify_control_bundle_archive(
-            readback.stdout, self._strict_control_bundle.manifest_digest
+            readback.stdout, self._strict_expected_control_manifest_digest
         )
 
     def _create_strict_control_volume(self, image: str) -> None:
@@ -1403,7 +1478,7 @@ class DockerEnvironment(BaseEnvironment):
         labels = [
             "--label", "hermes-strict-control=1",
             "--label", f"hermes-strict-lane={self._strict_control_lane}",
-            "--label", f"hermes-strict-manifest={self._strict_control_bundle.manifest_digest}",
+            "--label", f"hermes-strict-manifest={self._strict_expected_control_manifest_digest}",
         ]
         subprocess.run(
             [self._docker_exe, "volume", "create", *labels, self._strict_control_volume],
@@ -1412,15 +1487,11 @@ class DockerEnvironment(BaseEnvironment):
         )
         try:
             self._verify_strict_control_volume()
-            subprocess.run(
-                [
-                    self._docker_exe, "run", "--rm", "-i", "--network=none",
-                    "--user", "0:0", "--entrypoint", "tar",
-                    "--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime",
-                    image, "-xf", "-", "-C", "/runtime",
-                ],
-                input=self._strict_control_bundle.archive,
-                capture_output=True, timeout=120, check=True,
+            self._run_strict_control_helper(
+                image,
+                f"type=volume,src={self._strict_control_volume},dst=/runtime",
+                ["-xf", "-", "-C", "/runtime"],
+                input_bytes=self._strict_control_bundle.archive,
             )
             self._verify_strict_control_volume()
             self._verify_strict_control_volume_contents(image)
@@ -1700,7 +1771,7 @@ class DockerEnvironment(BaseEnvironment):
                     )
                     self._container_id = cid
                     logger.info("Recovery: restarted container %s", cid[:12])
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, OSError) as e:
                     logger.warning("Recovery: failed to start container %s: %s", cid[:12], e)
 
         # 2. No reusable container — create a fresh one.

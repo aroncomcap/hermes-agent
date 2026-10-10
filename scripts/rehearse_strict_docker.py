@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.environments.docker import DockerEnvironment, _normalize_strict_mounts
+from tools.environments.strict_control_bundle import load_control_bundle
 
 
 IMAGE = os.environ.get("HERMES_STRICT_REHEARSAL_IMAGE", "debian:12-slim")
@@ -70,6 +71,8 @@ def main() -> None:
             else:
                 raise RuntimeError("symlink escape negative control was accepted")
 
+            shared_manifest_digest = load_control_bundle(control, workspace).manifest_digest
+
             common = dict(
                 image=IMAGE,
                 cwd="/workspace",
@@ -90,6 +93,7 @@ def main() -> None:
                 ],
                 strict_control_source=str(control),
                 strict_control_lane="writer",
+                strict_control_manifest_digest=shared_manifest_digest,
             )
             try:
                 _run(writer, """
@@ -122,6 +126,7 @@ printf ok > /workspace/writer-proof.txt
                 ],
                 strict_control_source=str(control),
                 strict_control_lane="reviewer",
+                strict_control_manifest_digest=shared_manifest_digest,
             )
             try:
                 _run(reviewer, """

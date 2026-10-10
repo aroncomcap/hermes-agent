@@ -639,6 +639,7 @@ def load_cli_config() -> Dict[str, Any]:
         "docker_strict_mounts": "TERMINAL_DOCKER_STRICT_MOUNTS",
         "docker_strict_control_source": "TERMINAL_DOCKER_STRICT_CONTROL_SOURCE",
         "docker_strict_control_lane": "TERMINAL_DOCKER_STRICT_CONTROL_LANE",
+        "docker_strict_control_manifest_digest": "TERMINAL_DOCKER_STRICT_CONTROL_MANIFEST_DIGEST",
         "sandbox_dir": "TERMINAL_SANDBOX_DIR",
         # Persistent shell (non-local backends)
         "persistent_shell": "TERMINAL_PERSISTENT_SHELL",

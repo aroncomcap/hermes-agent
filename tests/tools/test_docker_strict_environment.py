@@ -280,6 +280,7 @@ def test_strict_config_parses_mounts_and_uses_workspace_cwd(monkeypatch, tmp_pat
     monkeypatch.setenv("TERMINAL_DOCKER_STRICT_MOUNTS", json.dumps(mounts))
     monkeypatch.setenv("TERMINAL_DOCKER_STRICT_CONTROL_SOURCE", str(workspace))
     monkeypatch.setenv("TERMINAL_DOCKER_STRICT_CONTROL_LANE", "writer")
+    monkeypatch.setenv("TERMINAL_DOCKER_STRICT_CONTROL_MANIFEST_DIGEST", "a" * 64)
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
 
     config = terminal_tool._get_env_config()
@@ -288,6 +289,7 @@ def test_strict_config_parses_mounts_and_uses_workspace_cwd(monkeypatch, tmp_pat
     assert config["docker_strict_mounts"] == mounts
     assert config["docker_strict_control_source"] == str(workspace)
     assert config["docker_strict_control_lane"] == "writer"
+    assert config["docker_strict_control_manifest_digest"] == "a" * 64
     assert config["cwd"] == "/workspace"
 
 
@@ -314,6 +316,7 @@ def test_strict_config_reaches_docker_environment(monkeypatch):
         container_config={
             "docker_strict_mode": True, "docker_strict_mounts": ["sentinel"],
             "docker_strict_control_source": "/control", "docker_strict_control_lane": "writer",
+            "docker_strict_control_manifest_digest": "a" * 64,
         },
     )
 
@@ -322,6 +325,7 @@ def test_strict_config_reaches_docker_environment(monkeypatch):
     assert captured["strict_mounts"] == ["sentinel"]
     assert captured["strict_control_source"] == "/control"
     assert captured["strict_control_lane"] == "writer"
+    assert captured["strict_control_manifest_digest"] == "a" * 64
 
 
 def test_strict_config_is_bridged_by_cli_gateway_and_sibling_tools():
@@ -342,6 +346,7 @@ def test_strict_config_is_bridged_by_cli_gateway_and_sibling_tools():
         assert "docker_strict_mounts" in keys, source
         assert "docker_strict_control_source" in keys, source
         assert "docker_strict_control_lane" in keys, source
+        assert "docker_strict_control_manifest_digest" in keys, source
 def _inspect_payload(tmp_path: Path) -> dict:
     return {
         "Id": "container-id",
@@ -855,6 +860,9 @@ def _volume_env():
     env._strict_control_volume = "hermes-strict-writer-test"
     env._strict_control_lane = "writer"
     env._strict_control_bundle = SimpleNamespace(manifest_digest="a" * 64, archive=b"tar")
+    env._strict_expected_control_manifest_digest = "a" * 64
+    env._strict_helper_label = "helper-label"
+    env._strict_expected_resources = {"NanoCpus": 1_000_000_000, "Memory": 536_870_912, "PidsLimit": 256}
     return env
 
 
@@ -900,19 +908,44 @@ def test_strict_control_volume_rejects_driver_options(monkeypatch):
         env._verify_strict_control_volume()
 
 
-def test_strict_control_volume_readback_uses_forced_tar_entrypoint(monkeypatch):
+def _assert_constrained_helper_run(args, *, readonly: bool):
+    assert args[:4] == ["docker", "run", "--name", args[3]]
+    assert args[3].startswith("hermes-strict-helper-")
+    for expected in (
+        "--label", "hermes-strict-control-helper=1",
+        "--label", "hermes-strict-helper=helper-label",
+        "--label", "hermes-strict-lane=writer",
+        "--label", f"hermes-strict-manifest={'a' * 64}",
+        "--network=none",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--read-only",
+        "--cpus", "1",
+        "--memory", "512m",
+        "--pids-limit", "256",
+        "--user", "0:0",
+        "--entrypoint", "tar",
+    ):
+        assert expected in args
+    mount = f"type=volume,src=hermes-strict-writer-test,dst=/runtime{',readonly' if readonly else ''}"
+    assert mount in args
+
+
+def test_strict_control_volume_readback_uses_constrained_helper(monkeypatch):
     env = _volume_env()
     env._image = "candidate-image"
     verified = []
+    calls = []
 
     def fake_run(args, **kwargs):
-        assert args == [
-            "docker", "run", "--rm", "--network=none",
-            "--user", "0:0", "--entrypoint", "tar",
-            "--mount", "type=volume,src=hermes-strict-writer-test,dst=/runtime,readonly",
-            "candidate-image", "-C", "/runtime", "-cf", "-", ".",
-        ]
-        return SimpleNamespace(stdout=b"archive")
+        calls.append(args)
+        if args[:2] == ["docker", "run"]:
+            _assert_constrained_helper_run(args, readonly=True)
+            assert args[-6:] == ["candidate-image", "-C", "/runtime", "-cf", "-", "."]
+            return SimpleNamespace(returncode=0, stdout=b"archive", stderr="")
+        if args[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
     monkeypatch.setattr(
@@ -924,18 +957,26 @@ def test_strict_control_volume_readback_uses_forced_tar_entrypoint(monkeypatch):
     env._verify_strict_control_volume_contents()
 
     assert verified == [(b"archive", "a" * 64)]
+    assert any(call[:3] == ["docker", "rm", "-f"] for call in calls)
 
 
-def test_strict_control_volume_populate_uses_forced_tar_entrypoint(monkeypatch):
+def test_strict_control_volume_populate_uses_constrained_helper(monkeypatch):
     env = _volume_env()
     calls = []
 
     def fake_run(args, **kwargs):
         calls.append(args)
         if args[:3] == ["docker", "volume", "inspect"]:
-            if len(calls) == 1:
+            if len([c for c in calls if c[:3] == ["docker", "volume", "inspect"]]) == 1:
                 return SimpleNamespace(returncode=1, stdout="", stderr="No such volume")
             return SimpleNamespace(returncode=0, stdout=json.dumps([_volume_payload()]), stderr="")
+        if args[:2] == ["docker", "run"]:
+            _assert_constrained_helper_run(args, readonly=False)
+            assert kwargs["input"] == b"tar"
+            assert args[-5:] == ["candidate-image", "-xf", "-", "-C", "/runtime"]
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
@@ -943,12 +984,131 @@ def test_strict_control_volume_populate_uses_forced_tar_entrypoint(monkeypatch):
 
     env._create_strict_control_volume("candidate-image")
 
-    assert [
-        "docker", "run", "--rm", "-i", "--network=none",
-        "--user", "0:0", "--entrypoint", "tar",
-        "--mount", "type=volume,src=hermes-strict-writer-test,dst=/runtime",
-        "candidate-image", "-xf", "-", "-C", "/runtime",
-    ] in calls
+    assert any(call[:2] == ["docker", "run"] for call in calls)
+
+
+def test_strict_control_helper_timeout_removes_residue(monkeypatch):
+    env = _volume_env()
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["docker", "run"]:
+            raise docker_env.subprocess.TimeoutExpired(args, timeout=120)
+        if args[:3] == ["docker", "rm", "-f"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(docker_env.subprocess.TimeoutExpired):
+        env._run_strict_control_helper(
+            "candidate-image",
+            "type=volume,src=hermes-strict-writer-test,dst=/runtime,readonly",
+            ["-C", "/runtime", "-cf", "-", "."],
+        )
+
+    assert any(call[:3] == ["docker", "rm", "-f"] for call in calls)
+    assert any(call[:2] == ["docker", "inspect"] for call in calls)
+
+
+def test_strict_control_helper_cleanup_fails_closed_on_residue(monkeypatch):
+    env = _volume_env()
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        return SimpleNamespace(returncode=0, stdout=b"archive", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="helper residue"):
+        env._run_strict_control_helper(
+            "candidate-image",
+            "type=volume,src=hermes-strict-writer-test,dst=/runtime,readonly",
+            ["-C", "/runtime", "-cf", "-", "."],
+        )
+
+
+def test_strict_lifecycle_cleans_volume_after_post_create_revalidation_failure(monkeypatch, tmp_path):
+    workspace = _workspace(tmp_path)
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "policy.txt").write_text("trusted", encoding="utf-8")
+    digest = docker_env.load_control_bundle(control, workspace).manifest_digest
+    calls = []
+
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: "1000:1000")
+    monkeypatch.setattr(docker_env, "_ensure_docker_available", lambda: None)
+    monkeypatch.setattr(docker_env, "_rootless_docker_available", lambda: True)
+    monkeypatch.setattr(docker_env, "_image_uses_init_entrypoint", lambda docker, image: False)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "docker")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_create_strict_control_volume",
+        lambda self, image: calls.append("create-volume") or setattr(self, "_strict_control_volume", "vol"),
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_revalidate_strict_mounts",
+        lambda self: (_ for _ in ()).throw(RuntimeError("post-create drift")),
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_teardown_strict_control_volume",
+        lambda self: calls.append("teardown-volume") or setattr(self, "_strict_control_volume", ""),
+    )
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda args, **kwargs: calls.append(args) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="post-create drift"):
+        docker_env.DockerEnvironment(
+            image="unused",
+            cwd="/workspace",
+            cpu=1,
+            memory=128,
+            network=False,
+            run_as_host_user=True,
+            persist_across_processes=False,
+            strict_mode=True,
+            strict_mounts=[{"source": str(workspace), "target": "/workspace", "mode": "rw"}],
+            strict_control_source=str(control),
+            strict_control_lane="writer",
+            strict_control_manifest_digest=digest,
+        )
+
+    assert "create-volume" in calls
+    assert "teardown-volume" in calls
+    assert ["docker", "rm", "-f"] == next(call[:3] for call in calls if isinstance(call, list) and call[:3] == ["docker", "rm", "-f"])
+
+
+def test_strict_control_source_requires_shared_manifest_match(monkeypatch, tmp_path):
+    workspace = _workspace(tmp_path)
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "policy.txt").write_text("trusted", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: "1000:1000")
+
+    with pytest.raises(ValueError, match="shared digest"):
+        docker_env.DockerEnvironment(
+            image="unused",
+            cwd="/workspace",
+            cpu=1,
+            memory=128,
+            network=False,
+            run_as_host_user=True,
+            persist_across_processes=False,
+            strict_mode=True,
+            strict_mounts=[{"source": str(workspace), "target": "/workspace", "mode": "rw"}],
+            strict_control_source=str(control),
+            strict_control_lane="writer",
+            strict_control_manifest_digest="b" * 64,
+        )
 
 
 def test_strict_control_bundle_rejects_caller_runtime_bind(monkeypatch, tmp_path):
@@ -976,6 +1136,7 @@ def test_strict_control_bundle_rejects_caller_runtime_bind(monkeypatch, tmp_path
             ],
             strict_control_source=str(control),
             strict_control_lane="writer",
+            strict_control_manifest_digest="a" * 64,
         )
 
 

@@ -1155,6 +1155,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_strict_mounts": config.get("docker_strict_mounts", []),
                     "docker_strict_control_source": config.get("docker_strict_control_source", ""),
                     "docker_strict_control_lane": config.get("docker_strict_control_lane", ""),
+                "docker_strict_control_manifest_digest": config.get("docker_strict_control_manifest_digest", ""),
                 }
 
             ssh_config = None
