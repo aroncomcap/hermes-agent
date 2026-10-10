@@ -57,7 +57,7 @@ def main() -> None:
             workspace, control = _prepare_mount_dirs(root_path)
             subprocess.run(["git", "init", "-q", str(workspace)], check=True)
             (workspace / "visible.txt").write_text("workspace", encoding="utf-8")
-            (runtime / "control.txt").write_text("control", encoding="utf-8")
+            (control / "control.txt").write_text("control", encoding="utf-8")
 
             link = root_path / "workspace-link"
             link.symlink_to(workspace, target_is_directory=True)
