@@ -637,6 +637,8 @@ def load_cli_config() -> Dict[str, Any]:
         "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
         "docker_strict_mode": "TERMINAL_DOCKER_STRICT_MODE",
         "docker_strict_mounts": "TERMINAL_DOCKER_STRICT_MOUNTS",
+        "docker_strict_control_source": "TERMINAL_DOCKER_STRICT_CONTROL_SOURCE",
+        "docker_strict_control_lane": "TERMINAL_DOCKER_STRICT_CONTROL_LANE",
         "sandbox_dir": "TERMINAL_SANDBOX_DIR",
         # Persistent shell (non-local backends)
         "persistent_shell": "TERMINAL_PERSISTENT_SHELL",

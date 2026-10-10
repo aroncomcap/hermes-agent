@@ -278,12 +278,16 @@ def test_strict_config_parses_mounts_and_uses_workspace_cwd(monkeypatch, tmp_pat
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     monkeypatch.setenv("TERMINAL_DOCKER_STRICT_MODE", "true")
     monkeypatch.setenv("TERMINAL_DOCKER_STRICT_MOUNTS", json.dumps(mounts))
+    monkeypatch.setenv("TERMINAL_DOCKER_STRICT_CONTROL_SOURCE", str(workspace))
+    monkeypatch.setenv("TERMINAL_DOCKER_STRICT_CONTROL_LANE", "writer")
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
 
     config = terminal_tool._get_env_config()
 
     assert config["docker_strict_mode"] is True
     assert config["docker_strict_mounts"] == mounts
+    assert config["docker_strict_control_source"] == str(workspace)
+    assert config["docker_strict_control_lane"] == "writer"
     assert config["cwd"] == "/workspace"
 
 
@@ -307,12 +311,17 @@ def test_strict_config_reaches_docker_environment(monkeypatch):
 
     result = terminal_tool._create_environment(
         env_type="docker", image="unused", cwd="/workspace", timeout=10,
-        container_config={"docker_strict_mode": True, "docker_strict_mounts": ["sentinel"]},
+        container_config={
+            "docker_strict_mode": True, "docker_strict_mounts": ["sentinel"],
+            "docker_strict_control_source": "/control", "docker_strict_control_lane": "writer",
+        },
     )
 
     assert result is sentinel
     assert captured["strict_mode"] is True
     assert captured["strict_mounts"] == ["sentinel"]
+    assert captured["strict_control_source"] == "/control"
+    assert captured["strict_control_lane"] == "writer"
 
 
 def test_strict_config_is_bridged_by_cli_gateway_and_sibling_tools():
@@ -331,6 +340,8 @@ def test_strict_config_is_bridged_by_cli_gateway_and_sibling_tools():
         }
         assert "docker_strict_mode" in keys, source
         assert "docker_strict_mounts" in keys, source
+        assert "docker_strict_control_source" in keys, source
+        assert "docker_strict_control_lane" in keys, source
 def _inspect_payload(tmp_path: Path) -> dict:
     return {
         "Id": "container-id",
@@ -813,3 +824,131 @@ def test_strict_pre_exec_inspection_rejects_identity_and_mount_drift(
 
     with pytest.raises(RuntimeError, match=failure):
         env._verify_strict_container(require_running=True)
+
+def _volume_env():
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._docker_exe = "docker"
+    env._strict_control_volume = "hermes-strict-writer-test"
+    env._strict_control_lane = "writer"
+    env._strict_control_bundle = SimpleNamespace(manifest_digest="a" * 64, archive=b"tar")
+    return env
+
+
+def _volume_payload(**overrides):
+    payload = {
+        "Name": "hermes-strict-writer-test",
+        "Driver": "local",
+        "Scope": "local",
+        "Options": {},
+        "Labels": {
+            "hermes-strict-control": "1",
+            "hermes-strict-lane": "writer",
+            "hermes-strict-manifest": "a" * 64,
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_strict_control_volume_rejects_reuse(monkeypatch):
+    env = _volume_env()
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="[]", stderr=""),
+    )
+    with pytest.raises(RuntimeError, match="reuse is forbidden"):
+        env._create_strict_control_volume("image")
+
+
+def test_strict_control_volume_rejects_driver_options(monkeypatch):
+    env = _volume_env()
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([_volume_payload(Options={"device": "/host"})]),
+            stderr="",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="driver policy changed"):
+        env._verify_strict_control_volume()
+
+
+def test_strict_control_bundle_rejects_caller_runtime_bind(monkeypatch, tmp_path):
+    workspace = _workspace(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "policy.txt").write_text("trusted", encoding="utf-8")
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: "1000:1000")
+
+    with pytest.raises(ValueError, match="forbids caller-supplied /runtime bind"):
+        docker_env.DockerEnvironment(
+            image="unused",
+            cwd="/workspace",
+            cpu=1,
+            memory=128,
+            network=False,
+            run_as_host_user=True,
+            persist_across_processes=False,
+            strict_mode=True,
+            strict_mounts=[
+                {"source": str(workspace), "target": "/workspace", "mode": "rw"},
+                {"source": str(runtime), "target": "/runtime", "mode": "ro"},
+            ],
+            strict_control_source=str(control),
+            strict_control_lane="writer",
+        )
+
+
+def test_strict_container_rejects_control_volume_substitution(monkeypatch, tmp_path):
+    payload = _inspect_payload(tmp_path)
+    payload["Mounts"].append({
+        "Type": "volume", "Name": "substitute", "Destination": "/runtime", "RW": False,
+    })
+    monkeypatch.setattr(
+        docker_env.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps([payload])),
+    )
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._docker_exe = "docker"
+    env._container_id = "container-id"
+    env._strict_created_container_id = "container-id"
+    env._strict_expected_image_id = "sha256:image-id"
+    env._strict_expected_mounts = [
+        {"Type": "bind", "Source": str(tmp_path.resolve()), "Destination": "/workspace", "RW": False},
+        {"Type": "volume", "Name": "expected", "Destination": "/runtime", "RW": False},
+    ]
+    env._strict_expected_resources = {
+        "NanoCpus": 1_000_000_000, "Memory": 536_870_912, "PidsLimit": 256,
+    }
+    env._strict_expected_user = "1000:1000"
+    with pytest.raises(RuntimeError, match="mount allowlist"):
+        env._verify_strict_container(require_running=True)
+
+
+def test_strict_control_volume_cleanup_verifies_exact_absence(monkeypatch):
+    env = _volume_env()
+    calls = []
+    responses = iter([
+        SimpleNamespace(returncode=0, stdout="", stderr=""),
+        SimpleNamespace(returncode=1, stdout="", stderr="Error: No such volume"),
+    ])
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return next(responses)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", run)
+
+    env._teardown_strict_control_volume()
+
+    assert calls == [
+        ["docker", "volume", "rm", "hermes-strict-writer-test"],
+        ["docker", "volume", "inspect", "hermes-strict-writer-test"],
+    ]
+    assert env._strict_control_volume == ""

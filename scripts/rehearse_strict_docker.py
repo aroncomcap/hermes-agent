@@ -32,18 +32,18 @@ def _prepare_mount_dirs(root_path: Path) -> tuple[Path, Path]:
     """Create mounts usable by a remapped container UID under a private parent."""
     root_path.chmod(0o711)
     workspace = root_path / "workspace"
-    runtime = root_path / "runtime"
+    control = root_path / "control"
     workspace.mkdir()
     workspace.chmod(0o777)
-    runtime.mkdir()
-    runtime.chmod(0o755)
-    return workspace, runtime
+    control.mkdir()
+    control.chmod(0o755)
+    return workspace, control
 
 
 def main() -> None:
     secret = "strict-provider-secret-must-stay-host-side"
     os.environ["HERMES_FAKE_PROVIDER_SECRET"] = secret
-    host_home_sentinel = Path.home() / ".com17806-host-sentinel"
+    host_home_sentinel = Path.home() / ".com17822-host-sentinel"
     host_home_sentinel.write_text("host-only", encoding="utf-8")
 
     try:
@@ -54,7 +54,7 @@ def main() -> None:
             prefix="hermes-strict-", dir=rehearsal_parent,
         ) as root:
             root_path = Path(root)
-            workspace, runtime = _prepare_mount_dirs(root_path)
+            workspace, control = _prepare_mount_dirs(root_path)
             subprocess.run(["git", "init", "-q", str(workspace)], check=True)
             (workspace / "visible.txt").write_text("workspace", encoding="utf-8")
             (runtime / "control.txt").write_text("control", encoding="utf-8")
@@ -84,11 +84,12 @@ def main() -> None:
             )
             writer = DockerEnvironment(
                 **common,
-                task_id="com17806-writer",
+                task_id="com17822-writer",
                 strict_mounts=[
                     {"source": str(workspace), "target": "/workspace", "mode": "rw"},
-                    {"source": str(runtime), "target": "/runtime", "mode": "ro"},
                 ],
+                strict_control_source=str(control),
+                strict_control_lane="writer",
             )
             try:
                 _run(writer, """
@@ -100,25 +101,38 @@ test ! -e /var/run/docker.sock
 test ! -e /root/.ssh
 test ! -e /root/.cache
 test ! -e /root/.hermes/skills
-test ! -e /home/hermes/.com17806-host-sentinel
-test ! -e /home/hermes/wt-com-17806-strict
+test ! -e /home/hermes/.com17822-host-sentinel
+test ! -e /home/hermes/work/com-17822-inode-isolated
 ! grep -a -q strict-provider-secret-must-stay-host-side /proc/1/environ
 ! awk 'NR > 1 { found=1 } END { exit found ? 0 : 1 }' /proc/net/route
 ! touch /runtime/must-fail
 printf ok > /workspace/writer-proof.txt
 """)
+                writer_volume = writer._strict_control_volume
+                if not writer_volume:
+                    raise RuntimeError("writer control volume was not created")
             finally:
                 _cleanup_and_wait(writer)
 
             reviewer = DockerEnvironment(
                 **common,
-                task_id="com17806-reviewer",
+                task_id="com17822-reviewer",
                 strict_mounts=[
                     {"source": str(workspace), "target": "/workspace", "mode": "ro"},
                 ],
+                strict_control_source=str(control),
+                strict_control_lane="reviewer",
             )
             try:
-                _run(reviewer, "test -f /workspace/writer-proof.txt && ! touch /workspace/reviewer-must-fail")
+                _run(reviewer, """
+set -eu
+test -f /workspace/writer-proof.txt
+test -f /runtime/control.txt
+! touch /workspace/reviewer-must-fail
+! touch /runtime/reviewer-must-fail
+""")
+                if not reviewer._strict_control_volume or reviewer._strict_control_volume == writer_volume:
+                    raise RuntimeError("writer and reviewer did not receive fresh separate volumes")
             finally:
                 _cleanup_and_wait(reviewer)
     finally:

@@ -22,6 +22,7 @@ from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
 )
+from tools.environments.strict_control_bundle import ControlBundle, load_control_bundle, verify_control_bundle_archive
 
 logger = logging.getLogger(__name__)
 
@@ -709,6 +710,8 @@ class DockerEnvironment(BaseEnvironment):
         persist_across_processes: bool = True,
         strict_mode: bool = False,
         strict_mounts: list[dict[str, str]] | None = None,
+        strict_control_source: str | None = None,
+        strict_control_lane: str | None = None,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -723,6 +726,9 @@ class DockerEnvironment(BaseEnvironment):
         self._strict_expected_user = ""
         self._strict_mounts: list[dict[str, str]] = []
         self._strict_created_container_id = ""
+        self._strict_control_bundle: ControlBundle | None = None
+        self._strict_control_volume = ""
+        self._strict_control_lane = ""
         self._propagate_init_session_errors = strict_mode
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
@@ -778,6 +784,29 @@ class DockerEnvironment(BaseEnvironment):
                 )
             normalized_strict_mounts = _normalize_strict_mounts(strict_mounts)
             self._strict_mounts = normalized_strict_mounts
+            if strict_control_source is not None:
+                if strict_control_lane not in {"writer", "reviewer"}:
+                    raise ValueError("strict control lane must be writer or reviewer")
+                if any(mount["target"] == "/runtime" for mount in normalized_strict_mounts):
+                    raise ValueError("strict control bundle forbids caller-supplied /runtime bind")
+                workspace_mount = next(
+                    mount for mount in normalized_strict_mounts
+                    if mount["target"] == "/workspace"
+                )
+                required_mode = "rw" if strict_control_lane == "writer" else "ro"
+                if workspace_mount["mode"] != required_mode:
+                    raise ValueError(
+                        f"strict {strict_control_lane} lane requires {required_mode} workspace"
+                    )
+                self._strict_control_bundle = load_control_bundle(
+                    strict_control_source, workspace_mount["source"]
+                )
+                self._strict_control_lane = strict_control_lane
+                self._strict_control_volume = (
+                    f"hermes-strict-{strict_control_lane}-{uuid.uuid4().hex}"
+                )
+            elif strict_control_lane is not None:
+                raise ValueError("strict control lane requires strict control source")
 
         # Fail fast if Docker is not available.
         _ensure_docker_available()
@@ -867,10 +896,16 @@ class DockerEnvironment(BaseEnvironment):
                     ),
                 ])
                 self._strict_expected_mounts.append({
+                    "Type": "bind",
                     "Source": mount["source"],
                     "Destination": mount["target"],
                     "RW": mount["mode"] == "rw",
                 })
+            if self._strict_control_bundle is not None:
+                volume_args.extend(["--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime,readonly"])
+                self._strict_expected_mounts.append(
+                    {"Type": "volume", "Name": self._strict_control_volume, "Destination": "/runtime", "RW": False}
+                )
             writable_args.extend([
                 "--read-only",
                 "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
@@ -1190,6 +1225,8 @@ class DockerEnvironment(BaseEnvironment):
             init_args = [] if image_uses_s6_init else ["--init"]
             lifecycle_command = "create" if strict_mode else "run"
             lifecycle_args = [] if strict_mode else ["-d"]
+            if strict_mode:
+                self._create_strict_control_volume(image)
             run_cmd = [
                 self._docker_exe, lifecycle_command, *lifecycle_args,
                 *init_args,
@@ -1229,6 +1266,8 @@ class DockerEnvironment(BaseEnvironment):
                     capture_output=True, timeout=10,
                     stdin=subprocess.DEVNULL,
                 )
+                if strict_mode and self._strict_control_volume:
+                    self._teardown_strict_control_volume()
                 raise
             self._container_id = result.stdout.strip()
             if strict_mode:
@@ -1236,6 +1275,7 @@ class DockerEnvironment(BaseEnvironment):
                     self._strict_created_container_id = self._container_id
                     self._strict_expected_image_id = self._inspect_image_id(image)
                     self._verify_strict_container(require_running=False)
+                    self._verify_strict_control_volume()
                     self._revalidate_strict_mounts()
                     subprocess.run(
                         [self._docker_exe, "start", self._container_id],
@@ -1248,6 +1288,8 @@ class DockerEnvironment(BaseEnvironment):
                 except Exception as lifecycle_exc:
                     try:
                         self._teardown_strict_container(self._container_id)
+                        if self._strict_control_volume:
+                            self._teardown_strict_control_volume()
                     except Exception as cleanup_exc:
                         raise RuntimeError(
                             "strict Docker lifecycle failed and teardown could not "
@@ -1269,6 +1311,8 @@ class DockerEnvironment(BaseEnvironment):
             if strict_mode and self._container_id:
                 try:
                     self._teardown_strict_container(self._container_id)
+                    if self._strict_control_volume:
+                        self._teardown_strict_control_volume()
                 except Exception as cleanup_exc:
                     raise RuntimeError(
                         "strict Docker initialization failed and teardown could not "
@@ -1276,6 +1320,110 @@ class DockerEnvironment(BaseEnvironment):
                     ) from init_exc
                 self._container_id = None
             raise
+
+    def _inspect_strict_control_volume(self) -> dict[str, Any]:
+        result = subprocess.run(
+            [self._docker_exe, "volume", "inspect", self._strict_control_volume],
+            capture_output=True, text=True, timeout=30, check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            inspected = json.loads(result.stdout)
+            if not isinstance(inspected, list) or len(inspected) != 1:
+                raise ValueError
+            return inspected[0]
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("strict control volume inspection was not trustworthy") from exc
+
+    def _verify_strict_control_volume(self) -> None:
+        if not getattr(self, "_strict_control_volume", ""):
+            return
+        info = self._inspect_strict_control_volume()
+        labels = info.get("Labels") or {}
+        expected_labels = {
+            "hermes-strict-control": "1",
+            "hermes-strict-lane": self._strict_control_lane,
+            "hermes-strict-manifest": self._strict_control_bundle.manifest_digest,
+        }
+        if (
+            info.get("Name") != self._strict_control_volume
+            or info.get("Driver") != "local"
+            or info.get("Scope") != "local"
+            or (info.get("Options") or {}) != {}
+            or labels != expected_labels
+        ):
+            raise RuntimeError("strict control volume identity or driver policy changed")
+
+    def _create_strict_control_volume(self, image: str) -> None:
+        if self._strict_control_bundle is None:
+            return
+        probe = subprocess.run(
+            [self._docker_exe, "volume", "inspect", self._strict_control_volume],
+            capture_output=True, text=True, timeout=30, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0:
+            raise RuntimeError("strict control volume reuse is forbidden")
+        if "no such volume" not in (probe.stderr or "").lower():
+            raise RuntimeError("strict control volume absence could not be proven")
+        labels = [
+            "--label", "hermes-strict-control=1",
+            "--label", f"hermes-strict-lane={self._strict_control_lane}",
+            "--label", f"hermes-strict-manifest={self._strict_control_bundle.manifest_digest}",
+        ]
+        subprocess.run(
+            [self._docker_exe, "volume", "create", *labels, self._strict_control_volume],
+            capture_output=True, text=True, timeout=30, check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            self._verify_strict_control_volume()
+            subprocess.run(
+                [
+                    self._docker_exe, "run", "--rm", "-i", "--network=none",
+                    "--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime",
+                    image, "sh", "-c",
+                    "tar -xf - -C /runtime && chmod -R a-w /runtime",
+                ],
+                input=self._strict_control_bundle.archive,
+                capture_output=True, timeout=120, check=True,
+            )
+            self._verify_strict_control_volume()
+            readback = subprocess.run(
+                [
+                    self._docker_exe, "run", "--rm", "--network=none",
+                    "--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime,readonly",
+                    image, "tar", "-C", "/runtime", "-cf", "-", ".",
+                ],
+                capture_output=True, timeout=120, check=True,
+                stdin=subprocess.DEVNULL,
+            )
+            verify_control_bundle_archive(
+                readback.stdout, self._strict_control_bundle.manifest_digest
+            )
+        except Exception:
+            self._teardown_strict_control_volume()
+            raise
+
+    def _teardown_strict_control_volume(self) -> None:
+        name = self._strict_control_volume
+        if not name:
+            return
+        result = subprocess.run(
+            [self._docker_exe, "volume", "rm", name],
+            capture_output=True, text=True, timeout=30, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("strict control volume removal failed")
+        probe = subprocess.run(
+            [self._docker_exe, "volume", "inspect", name],
+            capture_output=True, text=True, timeout=30, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0 or "no such volume" not in (probe.stderr or "").lower():
+            raise RuntimeError("strict control volume absence could not be verified")
+        self._strict_control_volume = ""
 
     def _inspect_image_id(self, image: str) -> str:
         """Resolve the immutable local image identity used by strict mode."""
@@ -1346,18 +1494,28 @@ class DockerEnvironment(BaseEnvironment):
             failures.append("image digest")
 
         actual_mounts: list[dict[str, Any]] = []
+        expected_mounts = [
+            ({"Type": "bind", **mount} if "Type" not in mount else mount)
+            for mount in self._strict_expected_mounts
+        ]
         for mount in info.get("Mounts") or []:
-            if mount.get("Type") != "bind":
-                failures.append("non-bind mount")
-                continue
-            actual_mounts.append({
-                "Source": str(Path(mount.get("Source", "")).resolve()),
+            mount_type = mount.get("Type")
+            actual = {
+                "Type": mount_type,
                 "Destination": mount.get("Destination"),
                 "RW": bool(mount.get("RW")),
-            })
+            }
+            if mount_type == "bind":
+                actual["Source"] = str(Path(mount.get("Source", "")).resolve())
+            elif mount_type == "volume":
+                actual["Name"] = mount.get("Name")
+            else:
+                failures.append("unsupported mount type")
+                continue
+            actual_mounts.append(actual)
         mount_key = lambda item: str(item.get("Destination"))
         if sorted(actual_mounts, key=mount_key) != sorted(
-            self._strict_expected_mounts, key=mount_key
+            expected_mounts, key=mount_key
         ):
             failures.append("mount allowlist")
 
@@ -1451,6 +1609,7 @@ class DockerEnvironment(BaseEnvironment):
         assert self._container_id, "Container not started"
         if getattr(self, "_strict_mode", False) and not self._strict_verified_pre_exec:
             self._revalidate_strict_mounts()
+            self._verify_strict_control_volume()
             self._verify_strict_container(require_running=True)
             self._strict_verified_pre_exec = True
         cmd = [self._docker_exe, "exec"]
@@ -1835,6 +1994,8 @@ class DockerEnvironment(BaseEnvironment):
 
         if self._strict_mode and should_remove:
             self._teardown_strict_container(container_id)
+            if getattr(self, "_strict_control_volume", ""):
+                self._teardown_strict_control_volume()
             self._container_id = None
             if not self._persistent:
                 for d in (self._workspace_dir, self._home_dir):

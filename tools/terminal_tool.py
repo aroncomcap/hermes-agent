@@ -1296,12 +1296,16 @@ def _get_env_config() -> Dict[str, Any]:
         docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON")
         docker_extra_args = _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON")
         docker_strict_mounts = _parse_env_var("TERMINAL_DOCKER_STRICT_MOUNTS", "[]", json.loads, "valid JSON")
+        docker_strict_control_source = os.getenv("TERMINAL_DOCKER_STRICT_CONTROL_SOURCE", "")
+        docker_strict_control_lane = os.getenv("TERMINAL_DOCKER_STRICT_CONTROL_LANE", "")
     else:
         docker_forward_env = []
         docker_volumes = []
         docker_env = {}
         docker_extra_args = []
         docker_strict_mounts = []
+        docker_strict_control_source = ""
+        docker_strict_control_lane = ""
 
     docker_strict_mode = (
         _parse_closed_bool_env("TERMINAL_DOCKER_STRICT_MODE")
@@ -1358,6 +1362,8 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "docker_strict_mode": docker_strict_mode,
         "docker_strict_mounts": docker_strict_mounts,
+        "docker_strict_control_source": docker_strict_control_source,
+        "docker_strict_control_lane": docker_strict_control_lane,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
@@ -1471,6 +1477,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
             strict_mode=cc.get("docker_strict_mode", False),
             strict_mounts=cc.get("docker_strict_mounts", []),
+            strict_control_source=cc.get("docker_strict_control_source") or None,
+            strict_control_lane=cc.get("docker_strict_control_lane") or None,
         )
     
     elif env_type == "singularity":
@@ -2243,6 +2251,8 @@ def terminal_tool(
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
                                 "docker_strict_mode": config.get("docker_strict_mode", False),
                                 "docker_strict_mounts": config.get("docker_strict_mounts", []),
+                                "docker_strict_control_source": config.get("docker_strict_control_source", ""),
+                                "docker_strict_control_lane": config.get("docker_strict_control_lane", ""),
                             }
 
                         local_config = None

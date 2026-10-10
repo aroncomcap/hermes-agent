@@ -692,6 +692,8 @@ def _get_or_create_env(task_id: str):
                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                 "docker_strict_mode": config.get("docker_strict_mode", False),
                 "docker_strict_mounts": config.get("docker_strict_mounts", []),
+                "docker_strict_control_source": config.get("docker_strict_control_source", ""),
+                "docker_strict_control_lane": config.get("docker_strict_control_lane", ""),
             }
 
         ssh_config = None
