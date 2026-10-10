@@ -14,7 +14,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.local import (
@@ -36,6 +36,50 @@ _DOCKER_SEARCH_PATHS = [
 
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_STRICT_MOUNT_TARGETS = {"/workspace", "/runtime"}
+
+
+def _normalize_strict_mounts(mounts: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    """Validate and canonicalize the complete strict-mode bind allowlist."""
+    if not isinstance(mounts, list) or not mounts:
+        raise ValueError("docker_strict_mounts must be a non-empty list")
+
+    normalized: list[dict[str, str]] = []
+    seen_targets: set[str] = set()
+    for entry in mounts:
+        if not isinstance(entry, dict):
+            raise ValueError("each docker_strict_mounts entry must be a mapping")
+        if set(entry) != {"source", "target", "mode"}:
+            raise ValueError("strict mount entries require only source, target, and mode")
+        source_raw = entry.get("source")
+        target = entry.get("target")
+        mode = entry.get("mode")
+        if not all(isinstance(v, str) and v for v in (source_raw, target, mode)):
+            raise ValueError("strict mount source, target, and mode must be non-empty strings")
+        source_abs = Path(source_raw).expanduser().absolute()
+        source = source_abs.resolve(strict=True)
+        if source_abs != source:
+            raise ValueError(f"strict mount source may not contain symlinks: {source_raw}")
+        if not source.is_dir():
+            raise ValueError(f"strict mount source must be a directory: {source}")
+        if target not in _STRICT_MOUNT_TARGETS or target in seen_targets:
+            raise ValueError(
+                f"strict mount target must be unique and one of {_STRICT_MOUNT_TARGETS}: {target}"
+            )
+        if mode not in {"ro", "rw"}:
+            raise ValueError("strict mount mode must be ro or rw")
+        if target == "/runtime" and mode != "ro":
+            raise ValueError("/runtime must be mounted read-only in strict mode")
+        if target == "/workspace" and not (source / ".git").is_dir():
+            raise ValueError(
+                "strict /workspace source must be a disposable clone with a .git directory"
+            )
+        seen_targets.add(target)
+        normalized.append({"source": str(source), "target": target, "mode": mode})
+
+    if "/workspace" not in seen_targets:
+        raise ValueError("strict mode requires exactly one /workspace mount")
+    return sorted(normalized, key=lambda item: item["target"])
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -565,6 +609,26 @@ def _ensure_docker_available() -> None:
             )
 
 
+def _rootless_docker_available() -> bool:
+    """Return whether the active Docker daemon proves rootless operation."""
+    docker_exe = find_docker()
+    if not docker_exe:
+        return False
+    try:
+        result = subprocess.run(
+            [docker_exe, "info", "--format", "{{json .SecurityOptions}}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        options = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return False
+    return isinstance(options, list) and "name=rootless" in options
+
+
 class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution with resource limits and persistence.
 
@@ -596,12 +660,19 @@ class DockerEnvironment(BaseEnvironment):
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
+        strict_mode: bool = False,
+        strict_mounts: list[dict[str, str]] | None = None,
     ):
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes
+        self._strict_mode = strict_mode
+        self._strict_verified_pre_exec = False
+        self._strict_expected_image_id = ""
+        self._strict_expected_mounts: list[dict[str, Any]] = []
+        self._strict_created_container_id = ""
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
@@ -617,8 +688,45 @@ class DockerEnvironment(BaseEnvironment):
             logger.warning(f"docker_volumes config is not a list: {volumes!r}")
             volumes = []
 
+        normalized_strict_mounts: list[dict[str, str]] = []
+        if strict_mode:
+            conflicts = {
+                "persistent_filesystem": persistent_filesystem,
+                "persist_across_processes": persist_across_processes,
+                "docker_volumes": bool(volumes),
+                "docker_forward_env": bool(forward_env),
+                "docker_env": bool(env),
+                "docker_extra_args": bool(extra_args),
+                "auto_mount_cwd": auto_mount_cwd,
+            }
+            enabled = sorted(name for name, value in conflicts.items() if value)
+            if enabled:
+                raise ValueError("strict Docker mode forbids: " + ", ".join(enabled))
+            if network:
+                raise ValueError("strict Docker mode requires docker_network=false")
+            if cwd != "/workspace":
+                raise ValueError("strict Docker mode requires cwd=/workspace")
+            if not run_as_host_user:
+                raise ValueError(
+                    "strict Docker mode requires docker_run_as_host_user=true"
+                )
+            user_spec = _resolve_host_user_spec()
+            if not user_spec or user_spec.split(":", 1)[0] == "0":
+                raise RuntimeError(
+                    "strict Docker mode requires a non-root host uid:gid"
+                )
+            if cpu <= 0 or memory <= 0 or not _cgroup_limits_available(image):
+                raise RuntimeError(
+                    "strict Docker mode requires enforceable CPU, memory, and PID limits"
+                )
+            normalized_strict_mounts = _normalize_strict_mounts(strict_mounts)
+
         # Fail fast if Docker is not available.
         _ensure_docker_available()
+        if strict_mode and not _rootless_docker_available():
+            raise RuntimeError(
+                "strict Docker mode requires a Docker daemon that reports name=rootless"
+            )
 
         # Build resource limit args (gated by cgroup availability probe so
         # they degrade gracefully on hosts without controller delegation,
@@ -641,6 +749,13 @@ class DockerEnvironment(BaseEnvironment):
                 )
         if not network:
             resource_args.append("--network=none")
+        if strict_mode:
+            resource_args = [
+                "--cpus", str(cpu),
+                "--memory", f"{memory}m",
+                "--pids-limit", _DEFAULT_PIDS_LIMIT,
+                "--network=none",
+            ]
 
         # Persistent workspace via bind mounts from a configurable host directory
         # (TERMINAL_SANDBOX_DIR, default ~/.hermes/sandboxes/). Non-persistent
@@ -650,7 +765,7 @@ class DockerEnvironment(BaseEnvironment):
         # User-configured volume mounts (from config.yaml docker_volumes)
         volume_args = []
         workspace_explicitly_mounted = False
-        for vol in (volumes or []):
+        for vol in ([] if strict_mode else (volumes or [])):
             if not isinstance(vol, str):
                 logger.warning(f"Docker volume entry is not a string: {vol!r}")
                 continue
@@ -677,7 +792,30 @@ class DockerEnvironment(BaseEnvironment):
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
         writable_args = []
-        if self._persistent:
+        if strict_mode:
+            for mount in normalized_strict_mounts:
+                volume_args.extend([
+                    "--mount",
+                    "type=bind,src={source},dst={target},readonly={readonly},bind-recursive=disabled".format(
+                        source=mount["source"],
+                        target=mount["target"],
+                        readonly=str(mount["mode"] == "ro").lower(),
+                    ),
+                ])
+                self._strict_expected_mounts.append({
+                    "Source": mount["source"],
+                    "Destination": mount["target"],
+                    "RW": mount["mode"] == "rw",
+                })
+            writable_args.extend([
+                "--read-only",
+                "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
+                "--tmpfs", "/var/tmp:rw,noexec,nosuid,nodev,size=256m",
+                "--tmpfs", "/home:rw,nosuid,nodev,size=64m",
+                "--tmpfs", "/root:rw,nosuid,nodev,size=64m",
+                "--tmpfs", "/workspace/.git:rw,noexec,nosuid,nodev,size=1m",
+            ])
+        elif self._persistent:
             sandbox = get_sandbox_dir() / "docker" / task_id
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
@@ -715,7 +853,7 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            for mount_entry in ([] if strict_mode else get_credential_file_mounts()):
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
@@ -744,7 +882,7 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in ([] if strict_mode else get_skills_directory_mount()):
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -766,7 +904,7 @@ class DockerEnvironment(BaseEnvironment):
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
+            for cache_mount in ([] if strict_mode else get_cache_directory_mounts()):
                 src = Path(cache_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -822,6 +960,10 @@ class DockerEnvironment(BaseEnvironment):
         # "Permission denied". Detected once here; defaults are kept on any
         # inspection failure. See issue #34628.
         image_uses_s6_init = _image_uses_init_entrypoint(self._docker_exe, image)
+        if strict_mode and image_uses_s6_init:
+            raise ValueError(
+                "strict Docker mode requires an image without a privileged init entrypoint"
+            )
         if image_uses_s6_init:
             logger.info(
                 "Docker: image %s uses /init (s6-overlay) as entrypoint — "
@@ -832,12 +974,17 @@ class DockerEnvironment(BaseEnvironment):
             run_as_host_user and bool(user_args),
             run_exec=image_uses_s6_init,
         )
+        if strict_mode:
+            security_args = [
+                "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges",
+            ]
 
         logger.info(f"Docker volume_args: {volume_args}")
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
         # Appended last so they can override defaults if needed.
         validated_extra = []
-        for arg in (extra_args or []):
+        for arg in ([] if strict_mode else (extra_args or [])):
             if not isinstance(arg, str):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
@@ -870,6 +1017,11 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
         ]
+        if strict_mode:
+            label_args.extend([
+                "--label", "hermes-strict=1",
+                "--label", f"hermes-strict-run={uuid.uuid4().hex}",
+            ])
         # Save args for container recreation on "No such container" recovery.
         self._image = image
         self._container_name = container_name
@@ -895,7 +1047,7 @@ class DockerEnvironment(BaseEnvironment):
         # false`` (or run ``docker rm -f`` against the labeled container) to
         # force a clean start.
         reused = False
-        if persist_across_processes:
+        if persist_across_processes and not strict_mode:
             existing = self._find_reusable_container(task_label, profile_name)
             if existing is not None:
                 container_id, state = existing
@@ -968,8 +1120,10 @@ class DockerEnvironment(BaseEnvironment):
             # images already provide their own /init PID 1, so adding --init
             # there creates two competing inits and breaks startup (#34628).
             init_args = [] if image_uses_s6_init else ["--init"]
+            lifecycle_command = "create" if strict_mode else "run"
+            lifecycle_args = [] if strict_mode else ["-d"]
             run_cmd = [
-                self._docker_exe, "run", "-d",
+                self._docker_exe, lifecycle_command, *lifecycle_args,
                 *init_args,
                 "--name", container_name,
                 *label_args,
@@ -1007,6 +1161,30 @@ class DockerEnvironment(BaseEnvironment):
                 )
                 raise
             self._container_id = result.stdout.strip()
+            if strict_mode:
+                try:
+                    self._strict_created_container_id = self._container_id
+                    self._strict_expected_image_id = self._inspect_image_id(image)
+                    self._verify_strict_container(require_running=False)
+                    subprocess.run(
+                        [self._docker_exe, "start", self._container_id],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=True,
+                        stdin=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    subprocess.run(
+                        [self._docker_exe, "rm", "-f", self._container_id],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    self._container_id = None
+                    raise
             logger.info(f"Started container {container_name} ({self._container_id[:12]})")
 
         # Build the init-time env forwarding args (used only by init_session
@@ -1017,12 +1195,111 @@ class DockerEnvironment(BaseEnvironment):
         # Initialize session snapshot inside the container
         self.init_session()
 
+    def _inspect_image_id(self, image: str) -> str:
+        """Resolve the immutable local image identity used by strict mode."""
+        result = subprocess.run(
+            [self._docker_exe, "image", "inspect", image, "--format", "{{.Id}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        image_id = result.stdout.strip()
+        if not image_id.startswith("sha256:"):
+            raise RuntimeError("strict Docker mode could not prove the image digest")
+        return image_id
+
+    def _verify_strict_container(self, *, require_running: bool) -> None:
+        """Fail closed unless the created container exactly matches strict policy."""
+        container_id = self._container_id
+        if not container_id or container_id != self._strict_created_container_id:
+            raise RuntimeError("strict Docker container identity changed before execution")
+
+        result = subprocess.run(
+            [self._docker_exe, "inspect", container_id],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            inspected = json.loads(result.stdout)
+            if not isinstance(inspected, list) or len(inspected) != 1:
+                raise ValueError("inspect did not return one container")
+            info = inspected[0]
+        except (ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError("strict Docker inspection was not trustworthy") from exc
+
+        failures: list[str] = []
+        if info.get("Id") != container_id:
+            failures.append("container identity")
+        if info.get("Image") != self._strict_expected_image_id:
+            failures.append("image digest")
+
+        actual_mounts: list[dict[str, Any]] = []
+        for mount in info.get("Mounts") or []:
+            if mount.get("Type") != "bind":
+                failures.append("non-bind mount")
+                continue
+            actual_mounts.append({
+                "Source": str(Path(mount.get("Source", "")).resolve()),
+                "Destination": mount.get("Destination"),
+                "RW": bool(mount.get("RW")),
+            })
+        mount_key = lambda item: str(item.get("Destination"))
+        if sorted(actual_mounts, key=mount_key) != sorted(
+            self._strict_expected_mounts, key=mount_key
+        ):
+            failures.append("mount allowlist")
+
+        host_config = info.get("HostConfig") or {}
+        config = info.get("Config") or {}
+        state = info.get("State") or {}
+        if host_config.get("NetworkMode") != "none":
+            failures.append("network mode")
+        if host_config.get("Privileged") is not False:
+            failures.append("privileged mode")
+        if host_config.get("ReadonlyRootfs") is not True:
+            failures.append("read-only rootfs")
+        if host_config.get("CapAdd") not in (None, []):
+            failures.append("added capabilities")
+        if "ALL" not in (host_config.get("CapDrop") or []):
+            failures.append("dropped capabilities")
+        if "no-new-privileges" not in (host_config.get("SecurityOpt") or []):
+            failures.append("no-new-privileges")
+        if host_config.get("PidMode") not in (None, ""):
+            failures.append("host PID namespace")
+        if not all(int(host_config.get(key) or 0) > 0 for key in ("NanoCpus", "Memory", "PidsLimit")):
+            failures.append("resource limits")
+        tmpfs = host_config.get("Tmpfs") or {}
+        for target in ("/tmp", "/var/tmp", "/home", "/root", "/workspace/.git"):
+            if target not in tmpfs:
+                failures.append(f"tmpfs {target}")
+
+        user = str(config.get("User") or "")
+        if not user or user in {"0", "root", "0:0"} or user.split(":", 1)[0] == "0":
+            failures.append("non-root user")
+        labels = config.get("Labels") or {}
+        if labels.get("hermes-strict") != "1" or not labels.get("hermes-strict-run"):
+            failures.append("strict identity labels")
+        if require_running and state.get("Running") is not True:
+            failures.append("running state")
+
+        if failures:
+            raise RuntimeError(
+                "strict Docker pre-exec verification failed: " + ", ".join(failures)
+            )
+
     def _build_init_env_args(self) -> list[str]:
         """Build -e KEY=VALUE args for injecting host env vars into init_session.
 
         These are used once during init_session() so that export -p captures
         them into the snapshot.  Subsequent execute() calls don't need -e flags.
         """
+        if getattr(self, "_strict_mode", False):
+            return []
         exec_env: dict[str, str] = dict(self._env)
 
         explicit_forward_keys = set(self._forward_env)
@@ -1059,6 +1336,9 @@ class DockerEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
+        if getattr(self, "_strict_mode", False) and not self._strict_verified_pre_exec:
+            self._verify_strict_container(require_running=True)
+            self._strict_verified_pre_exec = True
         cmd = [self._docker_exe, "exec"]
         if stdin_data is not None:
             cmd.append("-i")
