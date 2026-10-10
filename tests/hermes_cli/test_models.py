@@ -70,12 +70,79 @@ class TestFetchOpenRouterModels:
         a release (it dropped ``qwen/qwen3.7-max`` while this snapshot still
         lists it), so an unpinned test fails or passes with the network.
         Tests that need a specific manifest override this stub inside the test.
+
+        The fetch path resolves that getter with a function-local import of
+        ``hermes_cli.model_catalog``, so the name it calls is the catalog
+        module attribute. ``hermes_cli.models`` does not bind it.
+        ``test_curated_getter_binding_is_catalog_module_not_models_global``
+        fails if the import moves to module scope and this stub stops being
+        the lookup the fetch path uses.
         """
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
         monkeypatch.setattr(
             "hermes_cli.model_catalog.get_curated_openrouter_models",
             lambda: None,
         )
+
+    def test_curated_getter_binding_is_catalog_module_not_models_global(self, monkeypatch):
+        """The allowlist lookup is the catalog attribute, read on each call.
+
+        A same-named attribute planted on ``hermes_cli.models`` must not be
+        consulted. That is the binding the autouse fixture patches.
+        """
+        import dis
+
+        assert "get_curated_openrouter_models" not in _models_mod.__dict__
+        import_names = [
+            instr.argval
+            for instr in dis.get_instructions(fetch_openrouter_models)
+            if instr.opname == "IMPORT_NAME"
+        ]
+        assert "hermes_cli.model_catalog" in import_names
+
+        catalog_calls = []
+        models_calls = []
+
+        def from_catalog():
+            catalog_calls.append("catalog")
+            return [("binding-probe/catalog", "")]
+
+        def from_models_module():
+            models_calls.append("models")
+            return [("binding-probe/models", "")]
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    b'{"id":"binding-probe/catalog","pricing":{"prompt":"0.000001","completion":"0.000001"}},'
+                    b'{"id":"binding-probe/models","pricing":{"prompt":"0.000001","completion":"0.000001"}}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(
+            "hermes_cli.model_catalog.get_curated_openrouter_models",
+            from_catalog,
+        )
+        monkeypatch.setattr(
+            _models_mod,
+            "get_curated_openrouter_models",
+            from_models_module,
+            raising=False,
+        )
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        assert catalog_calls == ["catalog"]
+        assert models_calls == []
+        assert [mid for mid, _ in models] == ["binding-probe/catalog"]
 
     def test_live_fetch_recomputes_free_tags(self, monkeypatch):
         class _Resp:
