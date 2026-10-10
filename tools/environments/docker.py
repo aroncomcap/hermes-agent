@@ -43,6 +43,12 @@ _STRICT_MOUNT_TARGETS = {"/workspace", "/runtime"}
 
 def _validate_strict_source_tree(source: Path) -> None:
     """Fail closed unless *source* contains only real directories and files."""
+    _strict_source_file_inodes(source)
+
+
+def _strict_source_file_inodes(source: Path) -> set[tuple[int, int]]:
+    """Return regular-file inode identities for a validated strict source."""
+    found: set[tuple[int, int]] = set()
     pending = [source]
     while pending:
         directory = pending.pop()
@@ -54,18 +60,21 @@ def _validate_strict_source_tree(source: Path) -> None:
             ) from exc
         for entry in entries:
             try:
-                mode = entry.stat(follow_symlinks=False).st_mode
+                info = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 raise ValueError(
                     f"strict mount entry could not be safely inspected: {entry.path}"
                 ) from exc
-            if stat.S_ISDIR(mode):
+            if stat.S_ISDIR(info.st_mode):
                 pending.append(Path(entry.path))
-            elif not stat.S_ISREG(mode):
+            elif stat.S_ISREG(info.st_mode):
+                found.add((info.st_dev, info.st_ino))
+            else:
                 raise ValueError(
                     "strict mount source contains a symlink or special node: "
                     f"{entry.path}"
                 )
+    return found
 
 
 def _normalize_strict_mounts(mounts: list[dict[str, str]] | None) -> list[dict[str, str]]:
@@ -126,6 +135,11 @@ def _validate_strict_mount_isolation(mounts: list[dict[str, str]]) -> None:
             ):
                 raise ValueError(
                     "strict writable and read-only mount sources may not overlap: "
+                    f"{writable_source} and {read_only_source}"
+                )
+            if _strict_source_file_inodes(writable_source) & _strict_source_file_inodes(read_only_source):
+                raise ValueError(
+                    "strict writable and read-only mount sources may not share file inodes: "
                     f"{writable_source} and {read_only_source}"
                 )
 
@@ -1354,6 +1368,26 @@ class DockerEnvironment(BaseEnvironment):
         ):
             raise RuntimeError("strict control volume identity or driver policy changed")
 
+    def _verify_strict_control_volume_contents(self, image: str | None = None) -> None:
+        """Re-hash the live read-only control volume against the trusted manifest."""
+        if not getattr(self, "_strict_control_volume", ""):
+            return
+        if self._strict_control_bundle is None:
+            raise RuntimeError("strict control volume has no trusted bundle")
+        readback = subprocess.run(
+            [
+                self._docker_exe, "run", "--rm", "--network=none",
+                "--user", "0:0", "--entrypoint", "tar",
+                "--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime,readonly",
+                image or self._image, "-C", "/runtime", "-cf", "-", ".",
+            ],
+            capture_output=True, timeout=120, check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        verify_control_bundle_archive(
+            readback.stdout, self._strict_control_bundle.manifest_digest
+        )
+
     def _create_strict_control_volume(self, image: str) -> None:
         if self._strict_control_bundle is None:
             return
@@ -1381,26 +1415,15 @@ class DockerEnvironment(BaseEnvironment):
             subprocess.run(
                 [
                     self._docker_exe, "run", "--rm", "-i", "--network=none",
+                    "--user", "0:0", "--entrypoint", "tar",
                     "--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime",
-                    image, "sh", "-c",
-                    "tar -xf - -C /runtime && chmod -R a-w /runtime",
+                    image, "-xf", "-", "-C", "/runtime",
                 ],
                 input=self._strict_control_bundle.archive,
                 capture_output=True, timeout=120, check=True,
             )
             self._verify_strict_control_volume()
-            readback = subprocess.run(
-                [
-                    self._docker_exe, "run", "--rm", "--network=none",
-                    "--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime,readonly",
-                    image, "tar", "-C", "/runtime", "-cf", "-", ".",
-                ],
-                capture_output=True, timeout=120, check=True,
-                stdin=subprocess.DEVNULL,
-            )
-            verify_control_bundle_archive(
-                readback.stdout, self._strict_control_bundle.manifest_digest
-            )
+            self._verify_strict_control_volume_contents(image)
         except Exception:
             self._teardown_strict_control_volume()
             raise
@@ -1607,9 +1630,10 @@ class DockerEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
-        if getattr(self, "_strict_mode", False) and not self._strict_verified_pre_exec:
+        if getattr(self, "_strict_mode", False):
             self._revalidate_strict_mounts()
             self._verify_strict_control_volume()
+            self._verify_strict_control_volume_contents()
             self._verify_strict_container(require_running=True)
             self._strict_verified_pre_exec = True
         cmd = [self._docker_exe, "exec"]

@@ -44,7 +44,16 @@ def test_rejects_workspace_hardlink_alias(tmp_path):
     original = workspace / "same"
     original.write_text("content")
     os.link(original, control / "alias")
-    with pytest.raises(ValueError, match="aliases workspace inode"):
+    with pytest.raises(ValueError, match="aliases workspace inode|hardlink aliases"):
+        load_control_bundle(control, workspace)
+
+
+def test_rejects_control_source_hardlink_even_outside_workspace(tmp_path):
+    workspace, control = roots(tmp_path)
+    external = tmp_path / "external"
+    external.write_text("content")
+    os.link(external, control / "alias")
+    with pytest.raises(ValueError, match="hardlink aliases"):
         load_control_bundle(control, workspace)
 
 

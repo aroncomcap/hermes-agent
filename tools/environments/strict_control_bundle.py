@@ -68,6 +68,8 @@ def _read_tree(root: Path, forbidden: set[tuple[int, int]]):
                         pending.append((child_fd, relative))
                         keep = True
                     elif stat.S_ISREG(before.st_mode):
+                        if before.st_nlink != 1:
+                            raise ValueError(f"control source file has hardlink aliases: {relative}")
                         data = b""
                         while chunk := os.read(child_fd, 1024 * 1024):
                             data += chunk

@@ -697,7 +697,7 @@ def test_strict_init_failure_triggers_verified_teardown(monkeypatch, tmp_path):
     assert commands[-3:] == ["stop", "rm", "inspect"]
 
 
-def test_strict_revalidates_mounts_before_first_exec(monkeypatch):
+def test_strict_revalidates_mounts_before_every_exec(monkeypatch):
     events = []
     sentinel = object()
     env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
@@ -705,8 +705,11 @@ def test_strict_revalidates_mounts_before_first_exec(monkeypatch):
     env._container_id = "container-id"
     env._strict_mode = True
     env._strict_verified_pre_exec = False
+    env._strict_control_volume = "control-volume"
     env._init_env_args = []
     env._revalidate_strict_mounts = lambda: events.append("revalidate")
+    env._verify_strict_control_volume = lambda: events.append("control-volume")
+    env._verify_strict_control_volume_contents = lambda image=None: events.append("control-content")
     env._verify_strict_container = lambda **kwargs: events.append("inspect")
     monkeypatch.setattr(
         docker_env,
@@ -715,7 +718,11 @@ def test_strict_revalidates_mounts_before_first_exec(monkeypatch):
     )
 
     assert env._run_bash("true") is sentinel
-    assert events == ["revalidate", "inspect", "exec"]
+    assert env._run_bash("true") is sentinel
+    assert events == [
+        "revalidate", "control-volume", "control-content", "inspect", "exec",
+        "revalidate", "control-volume", "control-content", "inspect", "exec",
+    ]
 
 
 def test_strict_mount_race_is_rejected_on_revalidation(tmp_path):
@@ -743,6 +750,23 @@ def test_strict_mount_overlap_is_rejected_on_revalidation(tmp_path):
     ]
 
     with pytest.raises(RuntimeError, match="may not overlap"):
+        env._revalidate_strict_mounts()
+
+
+def test_strict_mount_hardlink_alias_is_rejected_on_revalidation(tmp_path):
+    workspace = _workspace(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    workspace_file = workspace / "shared"
+    workspace_file.write_text("content", encoding="utf-8")
+    os.link(workspace_file, runtime / "shared")
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._strict_mounts = [
+        {"source": str(workspace.resolve()), "target": "/workspace", "mode": "rw"},
+        {"source": str(runtime.resolve()), "target": "/runtime", "mode": "ro"},
+    ]
+
+    with pytest.raises(RuntimeError, match="share file inodes"):
         env._revalidate_strict_mounts()
 
 
@@ -874,6 +898,57 @@ def test_strict_control_volume_rejects_driver_options(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="driver policy changed"):
         env._verify_strict_control_volume()
+
+
+def test_strict_control_volume_readback_uses_forced_tar_entrypoint(monkeypatch):
+    env = _volume_env()
+    env._image = "candidate-image"
+    verified = []
+
+    def fake_run(args, **kwargs):
+        assert args == [
+            "docker", "run", "--rm", "--network=none",
+            "--user", "0:0", "--entrypoint", "tar",
+            "--mount", "type=volume,src=hermes-strict-writer-test,dst=/runtime,readonly",
+            "candidate-image", "-C", "/runtime", "-cf", "-", ".",
+        ]
+        return SimpleNamespace(stdout=b"archive")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        docker_env,
+        "verify_control_bundle_archive",
+        lambda archive, digest: verified.append((archive, digest)),
+    )
+
+    env._verify_strict_control_volume_contents()
+
+    assert verified == [(b"archive", "a" * 64)]
+
+
+def test_strict_control_volume_populate_uses_forced_tar_entrypoint(monkeypatch):
+    env = _volume_env()
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["docker", "volume", "inspect"]:
+            if len(calls) == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="No such volume")
+            return SimpleNamespace(returncode=0, stdout=json.dumps([_volume_payload()]), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    monkeypatch.setattr(env, "_verify_strict_control_volume_contents", lambda image=None: None)
+
+    env._create_strict_control_volume("candidate-image")
+
+    assert [
+        "docker", "run", "--rm", "-i", "--network=none",
+        "--user", "0:0", "--entrypoint", "tar",
+        "--mount", "type=volume,src=hermes-strict-writer-test,dst=/runtime",
+        "candidate-image", "-xf", "-", "-C", "/runtime",
+    ] in calls
 
 
 def test_strict_control_bundle_rejects_caller_runtime_bind(monkeypatch, tmp_path):
