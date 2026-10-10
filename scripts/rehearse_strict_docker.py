@@ -21,6 +21,25 @@ def _run(env: DockerEnvironment, command: str) -> None:
         raise RuntimeError(result.get("output", "strict rehearsal command failed"))
 
 
+def _cleanup_and_wait(env: DockerEnvironment) -> None:
+    """Remove a rehearsal container before the short-lived process exits."""
+    env.cleanup(force_remove=True)
+    if not env.wait_for_cleanup(timeout=45):
+        raise RuntimeError("strict rehearsal container cleanup timed out")
+
+
+def _prepare_mount_dirs(root_path: Path) -> tuple[Path, Path]:
+    """Create mounts usable by a remapped container UID under a private parent."""
+    root_path.chmod(0o711)
+    workspace = root_path / "workspace"
+    runtime = root_path / "runtime"
+    workspace.mkdir()
+    workspace.chmod(0o777)
+    runtime.mkdir()
+    runtime.chmod(0o755)
+    return workspace, runtime
+
+
 def main() -> None:
     secret = "strict-provider-secret-must-stay-host-side"
     os.environ["HERMES_FAKE_PROVIDER_SECRET"] = secret
@@ -28,12 +47,14 @@ def main() -> None:
     host_home_sentinel.write_text("host-only", encoding="utf-8")
 
     try:
-        with tempfile.TemporaryDirectory(prefix="hermes-strict-") as root:
+        rehearsal_parent = Path.home() / ".cache" / "hermes-strict-rehearsal"
+        rehearsal_parent.mkdir(parents=True, exist_ok=True)
+        rehearsal_parent.chmod(0o700)
+        with tempfile.TemporaryDirectory(
+            prefix="hermes-strict-", dir=rehearsal_parent,
+        ) as root:
             root_path = Path(root)
-            workspace = root_path / "workspace"
-            runtime = root_path / "runtime"
-            workspace.mkdir()
-            runtime.mkdir()
+            workspace, runtime = _prepare_mount_dirs(root_path)
             subprocess.run(["git", "init", "-q", str(workspace)], check=True)
             (workspace / "visible.txt").write_text("workspace", encoding="utf-8")
             (runtime / "control.txt").write_text("control", encoding="utf-8")
@@ -87,7 +108,7 @@ test ! -e /home/hermes/wt-com-17806-strict
 printf ok > /workspace/writer-proof.txt
 """)
             finally:
-                writer.cleanup(force_remove=True)
+                _cleanup_and_wait(writer)
 
             reviewer = DockerEnvironment(
                 **common,
@@ -99,7 +120,7 @@ printf ok > /workspace/writer-proof.txt
             try:
                 _run(reviewer, "test -f /workspace/writer-proof.txt && ! touch /workspace/reviewer-must-fail")
             finally:
-                reviewer.cleanup(force_remove=True)
+                _cleanup_and_wait(reviewer)
     finally:
         host_home_sentinel.unlink(missing_ok=True)
 
