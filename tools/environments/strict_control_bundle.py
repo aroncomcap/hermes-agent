@@ -107,42 +107,47 @@ def _read_tree(root: Path, forbidden: set[tuple[int, int]]):
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
     pending = [(root_fd, None)]
     directories, files = [], {}
-    while pending:
-        directory_fd, prefix = pending.pop()
-        try:
-            for name in sorted(os.listdir(directory_fd)):
-                relative = PurePosixPath(name) if prefix is None else prefix / name
-                _path(str(relative))
-                try:
-                    child_fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | NOFOLLOW, dir_fd=directory_fd)
-                except OSError as exc:
-                    raise ValueError(f"control source entry could not be opened safely: {relative}") from exc
-                keep = False
-                try:
-                    before = os.fstat(child_fd)
-                    if (before.st_dev, before.st_ino) in forbidden:
-                        raise ValueError(f"control source aliases workspace inode: {relative}")
-                    if stat.S_ISDIR(before.st_mode):
-                        directories.append(str(relative))
-                        pending.append((child_fd, relative))
-                        keep = True
-                    elif stat.S_ISREG(before.st_mode):
-                        if before.st_nlink != 1:
-                            raise ValueError(f"control source file has hardlink aliases: {relative}")
-                        data = b""
-                        while chunk := os.read(child_fd, 1024 * 1024):
-                            data += chunk
-                        after = os.fstat(child_fd)
-                        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-                            raise ValueError(f"control source changed while being read: {relative}")
-                        files[str(relative)] = (data, stat.S_IMODE(before.st_mode))
-                    else:
-                        raise ValueError(f"control source contains link or special node: {relative}")
-                finally:
-                    if not keep:
-                        os.close(child_fd)
-        finally:
+    try:
+        while pending:
+            directory_fd, prefix = pending.pop()
+            try:
+                for name in sorted(os.listdir(directory_fd)):
+                    relative = PurePosixPath(name) if prefix is None else prefix / name
+                    _path(str(relative))
+                    try:
+                        child_fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | NOFOLLOW, dir_fd=directory_fd)
+                    except OSError as exc:
+                        raise ValueError(f"control source entry could not be opened safely: {relative}") from exc
+                    keep = False
+                    try:
+                        before = os.fstat(child_fd)
+                        if (before.st_dev, before.st_ino) in forbidden:
+                            raise ValueError(f"control source aliases workspace inode: {relative}")
+                        if stat.S_ISDIR(before.st_mode):
+                            directories.append(str(relative))
+                            pending.append((child_fd, relative))
+                            keep = True
+                        elif stat.S_ISREG(before.st_mode):
+                            if before.st_nlink != 1:
+                                raise ValueError(f"control source file has hardlink aliases: {relative}")
+                            data = b""
+                            while chunk := os.read(child_fd, 1024 * 1024):
+                                data += chunk
+                            after = os.fstat(child_fd)
+                            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                                raise ValueError(f"control source changed while being read: {relative}")
+                            files[str(relative)] = (data, stat.S_IMODE(before.st_mode))
+                        else:
+                            raise ValueError(f"control source contains link or special node: {relative}")
+                    finally:
+                        if not keep:
+                            os.close(child_fd)
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        for directory_fd, _ in pending:
             os.close(directory_fd)
+        raise
     return sorted(directories), files
 
 
@@ -190,20 +195,21 @@ def verify_control_bundle_archive(archive_bytes: bytes, expected_digest: str) ->
                     raise ValueError(f"duplicate control bundle path: {name}")
                 seen.add(name)
                 if member.isdir():
-                    if member.mode & 0o222:
-                        raise ValueError(f"control bundle entry is writable: {name}")
-                    if member.mode & 0o555 != 0o555:
-                        raise ValueError(
-                            f"control bundle directory is not runtime-readable: {name}"
-                        )
+                    if member.mode != 0o555:
+                        raise ValueError(f"control bundle directory mode is invalid: {name}")
                     continue
                 if not member.isfile() or member.issym() or member.islnk():
                     raise ValueError(f"control bundle contains link or special node: {name}")
-                if member.mode & 0o222:
-                    raise ValueError(f"control bundle entry is writable: {name}")
-                if member.mode & 0o444 != 0o444:
-                    raise ValueError(f"control bundle entry is not runtime-readable: {name}")
-                file_modes[name] = member.mode & 0o777
+                if (
+                    member.mode & ~0o777
+                    or member.mode & 0o222
+                    or member.mode & 0o444 != 0o444
+                    or member.mode & ~0o555
+                ):
+                    raise ValueError(f"control bundle file mode is invalid: {name}")
+                if name == MANIFEST and member.mode != 0o444:
+                    raise ValueError("control bundle manifest mode is invalid")
+                file_modes[name] = member.mode
                 extracted = archive.extractfile(member)
                 if extracted is None:
                     raise ValueError(f"control bundle file unreadable: {name}")

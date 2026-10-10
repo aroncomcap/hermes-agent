@@ -168,6 +168,32 @@ def test_strict_source_tree_does_not_follow_swapped_directory(monkeypatch, tmp_p
         docker_env._validate_strict_source_tree(tmp_path)
 
 
+def test_strict_source_tree_rejects_root_swapped_during_open(monkeypatch, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    expected = docker_env._strict_source_root_identity(source)
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    real_open = docker_env.os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == source and not swapped:
+            source.rename(original)
+            replacement.rename(source)
+            swapped = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(docker_env.os, "open", swapping_open)
+
+    with pytest.raises(ValueError, match="source changed"):
+        docker_env._validate_strict_source_tree(
+            source, expected_root_identity=expected
+        )
+
+
 def test_strict_mode_rejects_raw_args_and_container_reuse():
     with pytest.raises(ValueError, match="docker_extra_args"):
         docker_env.DockerEnvironment(
@@ -1116,6 +1142,21 @@ def test_strict_control_helper_timeout_removes_residue(monkeypatch):
     assert any(call[:2] == ["docker", "inspect"] for call in calls)
 
 
+def test_strict_control_helper_rm_timeout_accepts_verified_absence(monkeypatch):
+    env = _volume_env()
+
+    def fake_run(args, **kwargs):
+        if args[:3] == ["docker", "rm", "-f"]:
+            raise docker_env.subprocess.TimeoutExpired(args, timeout=30)
+        if args[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    env._cleanup_strict_helper_container("hermes-strict-helper-test")
+
+
 def test_strict_control_helper_cleanup_fails_closed_on_residue(monkeypatch):
     env = _volume_env()
 
@@ -1135,14 +1176,25 @@ def test_strict_control_helper_cleanup_fails_closed_on_residue(monkeypatch):
         )
 
 
-def test_strict_control_helper_preserves_primary_error_with_cleanup_diagnostic(monkeypatch):
+@pytest.mark.parametrize(
+    "inspect_result",
+    [
+        SimpleNamespace(returncode=0, stdout="[]", stderr=""),
+        SimpleNamespace(returncode=1, stdout="", stderr="daemon unavailable"),
+    ],
+)
+def test_strict_control_helper_preserves_primary_error_with_cleanup_diagnostic(
+    monkeypatch, inspect_result
+):
     env = _volume_env()
 
     def fake_run(args, **kwargs):
         if args[:2] == ["docker", "run"]:
             raise docker_env.subprocess.TimeoutExpired(args, timeout=120)
+        if args[:3] == ["docker", "rm", "-f"]:
+            raise docker_env.subprocess.TimeoutExpired(args, timeout=30)
         if args[:2] == ["docker", "inspect"]:
-            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+            return inspect_result
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
@@ -1155,10 +1207,11 @@ def test_strict_control_helper_preserves_primary_error_with_cleanup_diagnostic(m
             user_spec="1000:1000",
         )
 
-    assert exc_info.value.__notes__ == [
-        "strict control helper cleanup also failed: "
-        "strict control helper residue could not be removed"
-    ]
+    assert len(exc_info.value.__notes__) == 1
+    note = exc_info.value.__notes__[0]
+    assert "strict control helper cleanup also failed" in note
+    assert "hermes-strict-helper-" in note
+    assert "docker rm failed" in note
 
 
 def test_strict_control_volume_preserves_primary_error_when_teardown_fails(monkeypatch):
@@ -1328,6 +1381,65 @@ def test_strict_container_create_preserves_primary_error_when_volume_cleanup_fai
         "strict Docker create cleanup also failed: container cleanup failure",
         "strict Docker create cleanup also failed: outer cleanup failure",
     ]
+
+
+def test_strict_container_create_cleans_acquired_volume_on_interrupt(monkeypatch, tmp_path):
+    workspace = _workspace(tmp_path)
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "policy.txt").write_text("trusted", encoding="utf-8")
+    digest = docker_env.load_control_bundle(control, workspace).manifest_digest
+    calls = []
+
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: "1000:1000")
+    monkeypatch.setattr(docker_env, "_ensure_docker_available", lambda: None)
+    monkeypatch.setattr(docker_env, "_rootless_docker_available", lambda: True)
+    monkeypatch.setattr(docker_env, "_image_uses_init_entrypoint", lambda docker, image: False)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "docker")
+
+    def acquire_then_interrupt(self, image):
+        self._strict_control_volume = "vol"
+        raise KeyboardInterrupt("interrupted after volume acquisition")
+
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_create_strict_control_volume",
+        acquire_then_interrupt,
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_teardown_strict_container",
+        lambda self, name: calls.append(("container", name)),
+    )
+
+    def teardown_volume(self):
+        calls.append(("volume", self._strict_control_volume))
+        self._strict_control_volume = ""
+
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_teardown_strict_control_volume",
+        teardown_volume,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="volume acquisition"):
+        docker_env.DockerEnvironment(
+            image="unused",
+            cwd="/workspace",
+            cpu=1,
+            memory=128,
+            network=False,
+            run_as_host_user=True,
+            persist_across_processes=False,
+            strict_mode=True,
+            strict_mounts=[{"source": str(workspace), "target": "/workspace", "mode": "rw"}],
+            strict_control_source=str(control),
+            strict_control_lane="writer",
+            strict_control_manifest_digest=digest,
+        )
+
+    assert calls[0][0] == "container"
+    assert calls[1] == ("volume", "vol")
 
 
 def test_strict_control_source_requires_shared_manifest_match(monkeypatch, tmp_path):
@@ -1558,3 +1670,23 @@ def test_strict_control_volume_cleanup_verifies_exact_absence(monkeypatch):
         ["docker", "volume", "inspect", "hermes-strict-writer-test"],
     ]
     assert env._strict_control_volume == ""
+
+
+def test_strict_control_volume_cleanup_composes_remove_and_inspect_timeouts(monkeypatch):
+    env = _volume_env()
+
+    def run(args, **kwargs):
+        timeout = 30
+        if args[:3] == ["docker", "volume", "rm"]:
+            raise docker_env.subprocess.TimeoutExpired(args, timeout=timeout)
+        if args[:3] == ["docker", "volume", "inspect"]:
+            raise docker_env.subprocess.TimeoutExpired(args, timeout=timeout)
+        raise AssertionError(args)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", run)
+
+    with pytest.raises(RuntimeError, match="volume removal failed") as exc_info:
+        env._teardown_strict_control_volume()
+
+    assert "absence verification also failed" in str(exc_info.value)
+    assert env._strict_control_volume == "hermes-strict-writer-test"

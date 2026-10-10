@@ -86,6 +86,75 @@ def test_rejects_archive_file_mode_drift_from_manifest(tmp_path):
         verify_control_bundle_archive(output.getvalue(), bundle.manifest_digest)
 
 
+@pytest.mark.parametrize(
+    ("target", "mode", "failure"),
+    [
+        ("private", 0o4555, "directory mode"),
+        ("private/policy.txt", 0o4444, "file mode"),
+        (".hermes-control-manifest.json", 0o1444, "file mode"),
+    ],
+)
+def test_rejects_archive_special_permission_bits(tmp_path, target, mode, failure):
+    workspace, control = roots(tmp_path)
+    private = control / "private"
+    private.mkdir()
+    (private / "policy.txt").write_text("policy")
+    bundle = load_control_bundle(control, workspace)
+    output = io.BytesIO()
+
+    with tarfile.open(fileobj=io.BytesIO(bundle.archive), mode="r:*") as source:
+        entries = []
+        for member in source.getmembers():
+            extracted = source.extractfile(member) if member.isfile() else None
+            entries.append((member, extracted.read() if extracted is not None else None))
+
+    with tarfile.open(fileobj=output, mode="w") as archive:
+        for member, data in entries:
+            if member.name == target:
+                member.mode = mode
+            archive.addfile(member, io.BytesIO(data) if data is not None else None)
+
+    with pytest.raises(ValueError, match=failure):
+        verify_control_bundle_archive(output.getvalue(), bundle.manifest_digest)
+
+
+def test_control_source_traversal_closes_queued_directory_fds_on_failure(
+    monkeypatch, tmp_path
+):
+    _, control = roots(tmp_path)
+    (control / "a").mkdir()
+    (control / "b").mkdir()
+    real_open = strict_control_bundle.os.open
+    real_listdir = strict_control_bundle.os.listdir
+    real_close = strict_control_bundle.os.close
+    child_fds = {}
+    closed = set()
+
+    def tracked_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if path in {"a", "b"} and kwargs.get("dir_fd") is not None:
+            child_fds[path] = fd
+        return fd
+
+    def failing_listdir(path):
+        if path == child_fds.get("b"):
+            raise OSError("queued traversal failure")
+        return real_listdir(path)
+
+    def tracked_close(fd):
+        closed.add(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(strict_control_bundle.os, "open", tracked_open)
+    monkeypatch.setattr(strict_control_bundle.os, "listdir", failing_listdir)
+    monkeypatch.setattr(strict_control_bundle.os, "close", tracked_close)
+
+    with pytest.raises(OSError, match="queued traversal failure"):
+        strict_control_bundle._read_tree(control, set())
+
+    assert {child_fds["a"], child_fds["b"]} <= closed
+
+
 def test_rejects_workspace_hardlink_alias(tmp_path):
     workspace, control = roots(tmp_path)
     original = workspace / "same"

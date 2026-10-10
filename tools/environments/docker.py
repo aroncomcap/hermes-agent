@@ -45,11 +45,16 @@ _STRICT_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
 def _validate_strict_source_tree(
-    source: Path, *, allow_runtime_artifacts: bool = False
+    source: Path,
+    *,
+    allow_runtime_artifacts: bool = False,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> None:
     """Fail closed unless *source* contains only real directories and files."""
     _strict_source_file_inodes(
-        source, allow_runtime_artifacts=allow_runtime_artifacts
+        source,
+        allow_runtime_artifacts=allow_runtime_artifacts,
+        expected_root_identity=expected_root_identity,
     )
 
 
@@ -67,7 +72,10 @@ def _strict_source_root_identity(source: Path) -> tuple[int, int]:
 
 
 def _strict_source_file_inodes(
-    source: Path, *, allow_runtime_artifacts: bool = False
+    source: Path,
+    *,
+    allow_runtime_artifacts: bool = False,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> set[tuple[int, int]]:
     """Return file inodes without following entries that can be swapped."""
     found: set[tuple[int, int]] = set()
@@ -79,6 +87,19 @@ def _strict_source_file_inodes(
         raise ValueError(
             f"strict mount source could not be safely inspected: {source}"
         ) from exc
+    try:
+        root_info = os.fstat(root_fd)
+    except OSError as exc:
+        os.close(root_fd)
+        raise ValueError(
+            f"strict mount source could not be safely inspected: {source}"
+        ) from exc
+    if expected_root_identity is not None and (
+        root_info.st_dev,
+        root_info.st_ino,
+    ) != expected_root_identity:
+        os.close(root_fd)
+        raise ValueError(f"strict mount source changed before execution: {source}")
     pending: list[tuple[int, Path]] = [(root_fd, source)]
     try:
         while pending:
@@ -199,7 +220,10 @@ def _normalize_strict_mounts(mounts: list[dict[str, str]] | None) -> list[dict[s
 
 
 def _validate_strict_mount_isolation(
-    mounts: list[dict[str, str]], *, allow_runtime_artifacts: bool = False
+    mounts: list[dict[str, str]],
+    *,
+    allow_runtime_artifacts: bool = False,
+    expected_root_identities: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     """Reject source aliases between writable and read-only strict mounts."""
     writable = [Path(item["source"]) for item in mounts if item["mode"] == "rw"]
@@ -218,9 +242,15 @@ def _validate_strict_mount_isolation(
             if _strict_source_file_inodes(
                 writable_source,
                 allow_runtime_artifacts=allow_runtime_artifacts,
+                expected_root_identity=(expected_root_identities or {}).get(
+                    str(writable_source)
+                ),
             ) & _strict_source_file_inodes(
                 read_only_source,
                 allow_runtime_artifacts=allow_runtime_artifacts,
+                expected_root_identity=(expected_root_identities or {}).get(
+                    str(read_only_source)
+                ),
             ):
                 raise ValueError(
                     "strict writable and read-only mount sources may not share file inodes: "
@@ -1362,7 +1392,7 @@ class DockerEnvironment(BaseEnvironment):
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, OSError) as e:
+            except BaseException as e:
                 # Docker may create the container object before `docker run`
                 # fails to start it (e.g. exit code 125 when the daemon isn't
                 # ready, or a timeout mid-pull). That orphan is left in
@@ -1376,14 +1406,14 @@ class DockerEnvironment(BaseEnvironment):
                 )
                 try:
                     self._teardown_strict_container(container_name)
-                except Exception as cleanup_error:
+                except BaseException as cleanup_error:
                     e.add_note(
                         f"strict Docker create cleanup also failed: {cleanup_error}"
                     )
                 if strict_mode and self._strict_control_volume:
                     try:
                         self._teardown_strict_control_volume()
-                    except Exception as cleanup_error:
+                    except BaseException as cleanup_error:
                         e.add_note(
                             f"strict Docker create cleanup also failed: {cleanup_error}"
                         )
@@ -1404,11 +1434,11 @@ class DockerEnvironment(BaseEnvironment):
                         check=True,
                         stdin=subprocess.DEVNULL,
                     )
-                except Exception as lifecycle_exc:
+                except BaseException as lifecycle_exc:
                     cleanup_failed = False
                     try:
                         self._teardown_strict_container(self._container_id)
-                    except Exception as cleanup_exc:
+                    except BaseException as cleanup_exc:
                         lifecycle_exc.add_note(
                             f"strict Docker lifecycle cleanup also failed: {cleanup_exc}"
                         )
@@ -1416,7 +1446,7 @@ class DockerEnvironment(BaseEnvironment):
                     if self._strict_control_volume:
                         try:
                             self._teardown_strict_control_volume()
-                        except Exception as cleanup_exc:
+                        except BaseException as cleanup_exc:
                             lifecycle_exc.add_note(
                                 f"strict Docker lifecycle cleanup also failed: {cleanup_exc}"
                             )
@@ -1434,12 +1464,12 @@ class DockerEnvironment(BaseEnvironment):
         # Initialize session snapshot inside the container
         try:
             self.init_session()
-        except Exception as init_exc:
+        except BaseException as init_exc:
             if strict_mode and self._container_id:
                 cleanup_failed = False
                 try:
                     self._teardown_strict_container(self._container_id)
-                except Exception as cleanup_exc:
+                except BaseException as cleanup_exc:
                     init_exc.add_note(
                         f"strict Docker initialization cleanup also failed: {cleanup_exc}"
                     )
@@ -1447,7 +1477,7 @@ class DockerEnvironment(BaseEnvironment):
                 if self._strict_control_volume:
                     try:
                         self._teardown_strict_control_volume()
-                    except Exception as cleanup_exc:
+                    except BaseException as cleanup_exc:
                         init_exc.add_note(
                             f"strict Docker initialization cleanup also failed: {cleanup_exc}"
                         )
@@ -1525,18 +1555,12 @@ class DockerEnvironment(BaseEnvironment):
         ]
 
     def _cleanup_strict_helper_container(self, name: str) -> None:
-        subprocess.run(
-            [self._docker_exe, "rm", "-f", name],
-            capture_output=True, text=True, timeout=30, check=False,
-            stdin=subprocess.DEVNULL,
-        )
-        probe = subprocess.run(
-            [self._docker_exe, "inspect", name],
-            capture_output=True, text=True, timeout=30, check=False,
-            stdin=subprocess.DEVNULL,
-        )
-        if probe.returncode == 0 or "no such" not in (probe.stderr or "").lower():
-            raise RuntimeError("strict control helper residue could not be removed")
+        try:
+            self._teardown_strict_container(name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"strict control helper residue cleanup failed for {name}: {exc}"
+            ) from exc
 
     def _run_strict_control_helper(
         self,
@@ -1561,7 +1585,7 @@ class DockerEnvironment(BaseEnvironment):
         except BaseException as primary_error:
             try:
                 self._cleanup_strict_helper_container(name)
-            except Exception as cleanup_error:
+            except BaseException as cleanup_error:
                 primary_error.add_note(
                     f"strict control helper cleanup also failed: {cleanup_error}"
                 )
@@ -1621,10 +1645,10 @@ class DockerEnvironment(BaseEnvironment):
             )
             self._verify_strict_control_volume()
             self._verify_strict_control_volume_contents(image)
-        except Exception as primary_error:
+        except BaseException as primary_error:
             try:
                 self._teardown_strict_control_volume()
-            except Exception as cleanup_error:
+            except BaseException as cleanup_error:
                 primary_error.add_note(
                     f"strict control volume cleanup also failed: {cleanup_error}"
                 )
@@ -1644,20 +1668,43 @@ class DockerEnvironment(BaseEnvironment):
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             remove_error = exc
-        probe = subprocess.run(
-            [self._docker_exe, "volume", "inspect", name],
-            capture_output=True, text=True, timeout=30, check=False,
-            stdin=subprocess.DEVNULL,
-        )
-        if probe.returncode != 0 and "no such volume" in (probe.stderr or "").lower():
+        probe = None
+        inspect_error = None
+        try:
+            probe = subprocess.run(
+                [self._docker_exe, "volume", "inspect", name],
+                capture_output=True, text=True, timeout=30, check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            inspect_error = exc
+        if (
+            probe is not None
+            and probe.returncode != 0
+            and "no such volume" in (probe.stderr or "").lower()
+        ):
             self._strict_control_volume = ""
             return
         if remove_error is not None:
+            suffix = (
+                f"; absence verification also failed: {inspect_error}"
+                if inspect_error is not None
+                else ""
+            )
             raise RuntimeError(
-                f"strict control volume removal failed: {remove_error}"
+                f"strict control volume removal failed: {remove_error}{suffix}"
             ) from remove_error
         if result is not None and result.returncode != 0:
-            raise RuntimeError("strict control volume removal failed")
+            suffix = (
+                f"; absence verification also failed: {inspect_error}"
+                if inspect_error is not None
+                else ""
+            )
+            raise RuntimeError(f"strict control volume removal failed{suffix}")
+        if inspect_error is not None:
+            raise RuntimeError(
+                f"strict control volume absence could not be verified: {inspect_error}"
+            ) from inspect_error
         raise RuntimeError("strict control volume absence could not be verified")
 
     def _inspect_image_id(self, image: str) -> str:
@@ -1698,14 +1745,23 @@ class DockerEnvironment(BaseEnvironment):
                 )
             try:
                 _validate_strict_source_tree(
-                    source, allow_runtime_artifacts=True
+                    source,
+                    allow_runtime_artifacts=True,
+                    expected_root_identity=expected_identity,
                 )
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
             revalidated.append({**mount, "source": str(resolved)})
         try:
             _validate_strict_mount_isolation(
-                revalidated, allow_runtime_artifacts=True
+                revalidated,
+                allow_runtime_artifacts=True,
+                expected_root_identities={
+                    mount["source"]: self._strict_mount_source_identities[
+                        mount["target"]
+                    ]
+                    for mount in revalidated
+                },
             )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
@@ -2213,7 +2269,9 @@ class DockerEnvironment(BaseEnvironment):
         """
         container_id = self._container_id
         if not container_id:
-            if self._strict_mode and getattr(self, "_strict_control_volume", ""):
+            if getattr(self, "_strict_mode", False) and getattr(
+                self, "_strict_control_volume", ""
+            ):
                 self._teardown_strict_control_volume()
             # Still drop the bind-mount dirs if any were allocated and we're
             # NOT in persist mode (persist mode preserves them).
