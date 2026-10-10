@@ -9,6 +9,7 @@ import pytest
 
 from tools.environments import docker as docker_env
 from tools import terminal_tool
+from scripts import rehearse_strict_docker
 
 
 def _workspace(tmp_path: Path) -> Path:
@@ -158,6 +159,46 @@ def test_strict_mode_fails_before_create_on_rootful_daemon(monkeypatch, tmp_path
             }],
         )
     assert lifecycle_calls == []
+
+
+def test_rehearsal_cleanup_waits_for_removal():
+    class FakeEnvironment:
+        def __init__(self, finished: bool):
+            self.finished = finished
+            self.cleanup_calls = []
+            self.wait_calls = []
+
+        def cleanup(self, *, force_remove: bool):
+            self.cleanup_calls.append(force_remove)
+
+        def wait_for_cleanup(self, timeout: float):
+            self.wait_calls.append(timeout)
+            return self.finished
+
+    completed = FakeEnvironment(finished=True)
+    rehearse_strict_docker._cleanup_and_wait(completed)
+    assert completed.cleanup_calls == [True]
+    assert completed.wait_calls == [45]
+
+    timed_out = FakeEnvironment(finished=False)
+    with pytest.raises(RuntimeError, match="cleanup timed out"):
+        rehearse_strict_docker._cleanup_and_wait(timed_out)
+    assert timed_out.cleanup_calls == [True]
+    assert timed_out.wait_calls == [45]
+
+
+def test_rehearsal_mount_dirs_support_remapped_uid_under_private_parent(tmp_path):
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    root = parent / "run"
+    root.mkdir(mode=0o700)
+
+    workspace, runtime = rehearse_strict_docker._prepare_mount_dirs(root)
+
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(root.stat().st_mode) == 0o711
+    assert stat.S_IMODE(workspace.stat().st_mode) == 0o777
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o755
 
 
 def test_strict_config_parses_mounts_and_uses_workspace_cwd(monkeypatch, tmp_path):
