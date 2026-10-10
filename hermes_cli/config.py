@@ -1239,6 +1239,10 @@ DEFAULT_CONFIG = {
         # Docker runs with --network=none so commands cannot reach the network.
         "docker_network": True,
         "docker_extra_args": [],        # Extra flags passed verbatim to docker run
+        # Opt-in, fail-closed Docker tool isolation. Mounts are explicit mappings
+        # with source, target (/workspace or /runtime), and mode (ro/rw).
+        "docker_strict_mode": False,
+        "docker_strict_mounts": [],
         # Explicit opt-in: run the Docker container as the host user's uid:gid
         # (via `--user`).  When enabled, files written into bind-mounted dirs
         # (docker_volumes, the persistent workspace, or the auto-mounted cwd)
@@ -6839,6 +6843,8 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
     "docker_network": "TERMINAL_DOCKER_NETWORK",
     "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
+    "docker_strict_mode": "TERMINAL_DOCKER_STRICT_MODE",
+    "docker_strict_mounts": "TERMINAL_DOCKER_STRICT_MOUNTS",
     "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
     "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
