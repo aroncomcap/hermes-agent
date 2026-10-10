@@ -1437,7 +1437,7 @@ class DockerEnvironment(BaseEnvironment):
         name = f"hermes-strict-helper-{uuid.uuid4().hex}"
         cmd = [*self._strict_helper_base_args(name), "--mount", mount_spec, image, *tar_args]
         try:
-            return subprocess.run(
+            result = subprocess.run(
                 cmd,
                 input=input_bytes,
                 capture_output=True,
@@ -1445,8 +1445,17 @@ class DockerEnvironment(BaseEnvironment):
                 check=True,
                 stdin=subprocess.DEVNULL if input_bytes is None else None,
             )
-        finally:
+        except BaseException as primary_error:
+            try:
+                self._cleanup_strict_helper_container(name)
+            except Exception as cleanup_error:
+                primary_error.add_note(
+                    f"strict control helper cleanup also failed: {cleanup_error}"
+                )
+            raise
+        else:
             self._cleanup_strict_helper_container(name)
+            return result
 
     def _verify_strict_control_volume_contents(self, image: str | None = None) -> None:
         """Re-hash the live read-only control volume against the trusted manifest."""

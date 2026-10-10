@@ -1032,6 +1032,31 @@ def test_strict_control_helper_cleanup_fails_closed_on_residue(monkeypatch):
         )
 
 
+def test_strict_control_helper_preserves_primary_error_with_cleanup_diagnostic(monkeypatch):
+    env = _volume_env()
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["docker", "run"]:
+            raise docker_env.subprocess.TimeoutExpired(args, timeout=120)
+        if args[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(docker_env.subprocess.TimeoutExpired) as exc_info:
+        env._run_strict_control_helper(
+            "candidate-image",
+            "type=volume,src=hermes-strict-writer-test,dst=/runtime,readonly",
+            ["-C", "/runtime", "-cf", "-", "."],
+        )
+
+    assert exc_info.value.__notes__ == [
+        "strict control helper cleanup also failed: "
+        "strict control helper residue could not be removed"
+    ]
+
+
 def test_strict_lifecycle_cleans_volume_after_post_create_revalidation_failure(monkeypatch, tmp_path):
     workspace = _workspace(tmp_path)
     control = tmp_path / "control"
