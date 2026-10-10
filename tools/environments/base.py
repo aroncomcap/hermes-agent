@@ -321,6 +321,7 @@ class BaseEnvironment(ABC):
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
+        self._propagate_init_session_errors = False
 
     # ------------------------------------------------------------------
     # Abstract methods
@@ -445,6 +446,8 @@ class BaseEnvironment(ABC):
                 exc,
             )
             self._snapshot_ready = False
+            if self._propagate_init_session_errors:
+                raise
 
     # ------------------------------------------------------------------
     # Command wrapping

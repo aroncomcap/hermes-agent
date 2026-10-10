@@ -108,7 +108,25 @@ def _normalize_strict_mounts(mounts: list[dict[str, str]] | None) -> list[dict[s
 
     if "/workspace" not in seen_targets:
         raise ValueError("strict mode requires exactly one /workspace mount")
+    _validate_strict_mount_isolation(normalized)
     return sorted(normalized, key=lambda item: item["target"])
+
+
+def _validate_strict_mount_isolation(mounts: list[dict[str, str]]) -> None:
+    """Reject source aliases between writable and read-only strict mounts."""
+    writable = [Path(item["source"]) for item in mounts if item["mode"] == "rw"]
+    read_only = [Path(item["source"]) for item in mounts if item["mode"] == "ro"]
+    for writable_source in writable:
+        for read_only_source in read_only:
+            if (
+                writable_source == read_only_source
+                or writable_source.is_relative_to(read_only_source)
+                or read_only_source.is_relative_to(writable_source)
+            ):
+                raise ValueError(
+                    "strict writable and read-only mount sources may not overlap: "
+                    f"{writable_source} and {read_only_source}"
+                )
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -702,8 +720,10 @@ class DockerEnvironment(BaseEnvironment):
         self._strict_expected_image_id = ""
         self._strict_expected_mounts: list[dict[str, Any]] = []
         self._strict_expected_resources: dict[str, int] = {}
+        self._strict_expected_user = ""
         self._strict_mounts: list[dict[str, str]] = []
         self._strict_created_container_id = ""
+        self._propagate_init_session_errors = strict_mode
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
@@ -742,10 +762,16 @@ class DockerEnvironment(BaseEnvironment):
                     "strict Docker mode requires docker_run_as_host_user=true"
                 )
             user_spec = _resolve_host_user_spec()
-            if not user_spec or user_spec.split(":", 1)[0] == "0":
+            if not user_spec or not re.fullmatch(r"[0-9]+:[0-9]+", user_spec):
+                raise RuntimeError(
+                    "strict Docker mode requires an exact numeric host uid:gid"
+                )
+            uid, gid = (int(part) for part in user_spec.split(":", 1))
+            if uid == 0 or gid == 0:
                 raise RuntimeError(
                     "strict Docker mode requires a non-root host uid:gid"
                 )
+            self._strict_expected_user = user_spec
             if cpu <= 0 or memory <= 0:
                 raise RuntimeError(
                     "strict Docker mode requires positive CPU and memory limits"
@@ -974,7 +1000,11 @@ class DockerEnvironment(BaseEnvironment):
         # platforms without POSIX uid/gid (e.g. native Windows Docker).
         user_args: list[str] = []
         if run_as_host_user:
-            user_spec = _resolve_host_user_spec()
+            user_spec = (
+                self._strict_expected_user
+                if strict_mode
+                else _resolve_host_user_spec()
+            )
             if user_spec is not None:
                 user_args = ["--user", user_spec]
                 logger.info("Docker: running container as host user %s", user_spec)
@@ -1215,15 +1245,14 @@ class DockerEnvironment(BaseEnvironment):
                         check=True,
                         stdin=subprocess.DEVNULL,
                     )
-                except Exception:
-                    subprocess.run(
-                        [self._docker_exe, "rm", "-f", self._container_id],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                        check=False,
-                        stdin=subprocess.DEVNULL,
-                    )
+                except Exception as lifecycle_exc:
+                    try:
+                        self._teardown_strict_container(self._container_id)
+                    except Exception as cleanup_exc:
+                        raise RuntimeError(
+                            "strict Docker lifecycle failed and teardown could not "
+                            f"be verified: {cleanup_exc}"
+                        ) from lifecycle_exc
                     self._container_id = None
                     raise
             logger.info(f"Started container {container_name} ({self._container_id[:12]})")
@@ -1234,7 +1263,19 @@ class DockerEnvironment(BaseEnvironment):
         self._init_env_args = self._build_init_env_args()
 
         # Initialize session snapshot inside the container
-        self.init_session()
+        try:
+            self.init_session()
+        except Exception as init_exc:
+            if strict_mode and self._container_id:
+                try:
+                    self._teardown_strict_container(self._container_id)
+                except Exception as cleanup_exc:
+                    raise RuntimeError(
+                        "strict Docker initialization failed and teardown could not "
+                        f"be verified: {cleanup_exc}"
+                    ) from init_exc
+                self._container_id = None
+            raise
 
     def _inspect_image_id(self, image: str) -> str:
         """Resolve the immutable local image identity used by strict mode."""
@@ -1253,6 +1294,7 @@ class DockerEnvironment(BaseEnvironment):
 
     def _revalidate_strict_mounts(self) -> None:
         """Re-prove canonical strict mount sources at every lifecycle boundary."""
+        revalidated: list[dict[str, str]] = []
         for mount in self._strict_mounts:
             source = Path(mount["source"])
             try:
@@ -1269,6 +1311,11 @@ class DockerEnvironment(BaseEnvironment):
                 _validate_strict_source_tree(source)
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
+            revalidated.append({**mount, "source": str(resolved)})
+        try:
+            _validate_strict_mount_isolation(revalidated)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def _verify_strict_container(self, *, require_running: bool) -> None:
         """Fail closed unless the created container exactly matches strict policy."""
@@ -1342,8 +1389,8 @@ class DockerEnvironment(BaseEnvironment):
                 failures.append(f"tmpfs {target}")
 
         user = str(config.get("User") or "")
-        if not user or user in {"0", "root", "0:0"} or user.split(":", 1)[0] == "0":
-            failures.append("non-root user")
+        if user != self._strict_expected_user:
+            failures.append("user identity")
         labels = config.get("Labels") or {}
         if labels.get("hermes-strict") != "1" or not labels.get("hermes-strict-run"):
             failures.append("strict identity labels")
@@ -1672,6 +1719,46 @@ class DockerEnvironment(BaseEnvironment):
                 running = (cid, state)
         return running or first
 
+    def _teardown_strict_container(self, container_id: str) -> None:
+        """Synchronously remove one strict container and prove it is absent."""
+        failures: list[str] = []
+        for action in (["stop", "-t", "10"], ["rm", "-f"]):
+            try:
+                result = subprocess.run(
+                    [self._docker_exe, *action, container_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+                if result.returncode != 0:
+                    failures.append(f"docker {action[0]} exited {result.returncode}")
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                failures.append(f"docker {action[0]} failed: {exc}")
+
+        try:
+            inspected = subprocess.run(
+                [self._docker_exe, "inspect", container_id],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if inspected.returncode == 0:
+                failures.append("container still exists after removal")
+            elif not any(
+                marker in (inspected.stderr or "").lower()
+                for marker in ("no such object", "no such container")
+            ):
+                failures.append("container absence could not be verified")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            failures.append(f"container absence check failed: {exc}")
+
+        if failures:
+            raise RuntimeError("strict Docker teardown failed: " + "; ".join(failures))
+
     def cleanup(self, *, force_remove: bool = False):
         """Tear down the container according to persist mode and *force_remove*.
 
@@ -1745,6 +1832,15 @@ class DockerEnvironment(BaseEnvironment):
         else:
             should_stop = True
             should_remove = True
+
+        if self._strict_mode and should_remove:
+            self._teardown_strict_container(container_id)
+            self._container_id = None
+            if not self._persistent:
+                for d in (self._workspace_dir, self._home_dir):
+                    if d:
+                        shutil.rmtree(d, ignore_errors=True)
+            return
 
         # Capture state needed by the worker before we null out the attrs —
         # the worker thread can outlive ``self``.
