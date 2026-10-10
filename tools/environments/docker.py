@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -39,6 +40,33 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _STRICT_MOUNT_TARGETS = {"/workspace", "/runtime"}
 
 
+def _validate_strict_source_tree(source: Path) -> None:
+    """Fail closed unless *source* contains only real directories and files."""
+    pending = [source]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise ValueError(
+                f"strict mount source could not be safely inspected: {directory}"
+            ) from exc
+        for entry in entries:
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise ValueError(
+                    f"strict mount entry could not be safely inspected: {entry.path}"
+                ) from exc
+            if stat.S_ISDIR(mode):
+                pending.append(Path(entry.path))
+            elif not stat.S_ISREG(mode):
+                raise ValueError(
+                    "strict mount source contains a symlink or special node: "
+                    f"{entry.path}"
+                )
+
+
 def _normalize_strict_mounts(mounts: list[dict[str, str]] | None) -> list[dict[str, str]]:
     """Validate and canonicalize the complete strict-mode bind allowlist."""
     if not isinstance(mounts, list) or not mounts:
@@ -62,6 +90,7 @@ def _normalize_strict_mounts(mounts: list[dict[str, str]] | None) -> list[dict[s
             raise ValueError(f"strict mount source may not contain symlinks: {source_raw}")
         if not source.is_dir():
             raise ValueError(f"strict mount source must be a directory: {source}")
+        _validate_strict_source_tree(source)
         if target not in _STRICT_MOUNT_TARGETS or target in seen_targets:
             raise ValueError(
                 f"strict mount target must be unique and one of {_STRICT_MOUNT_TARGETS}: {target}"
@@ -672,6 +701,8 @@ class DockerEnvironment(BaseEnvironment):
         self._strict_verified_pre_exec = False
         self._strict_expected_image_id = ""
         self._strict_expected_mounts: list[dict[str, Any]] = []
+        self._strict_expected_resources: dict[str, int] = {}
+        self._strict_mounts: list[dict[str, str]] = []
         self._strict_created_container_id = ""
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
@@ -715,11 +746,12 @@ class DockerEnvironment(BaseEnvironment):
                 raise RuntimeError(
                     "strict Docker mode requires a non-root host uid:gid"
                 )
-            if cpu <= 0 or memory <= 0 or not _cgroup_limits_available(image):
+            if cpu <= 0 or memory <= 0:
                 raise RuntimeError(
-                    "strict Docker mode requires enforceable CPU, memory, and PID limits"
+                    "strict Docker mode requires positive CPU and memory limits"
                 )
             normalized_strict_mounts = _normalize_strict_mounts(strict_mounts)
+            self._strict_mounts = normalized_strict_mounts
 
         # Fail fast if Docker is not available.
         _ensure_docker_available()
@@ -732,30 +764,36 @@ class DockerEnvironment(BaseEnvironment):
         # they degrade gracefully on hosts without controller delegation,
         # e.g. unprivileged LXCs). The probe runs once per process and is
         # cached host-wide.
-        resource_args = []
-        if cpu > 0 and _cgroup_limits_available(image):
-            resource_args.extend(["--cpus", str(cpu)])
-        if memory > 0 and _cgroup_limits_available(image):
-            resource_args.extend(["--memory", f"{memory}m"])
-        if _cgroup_limits_available(image):
-            resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
-        if disk > 0 and sys.platform != "darwin":
-            if self._storage_opt_supported():
-                resource_args.extend(["--storage-opt", f"size={disk}m"])
-            else:
-                logger.warning(
-                    "Docker storage driver does not support per-container disk limits "
-                    "(requires overlay2 on XFS with pquota). Container will run without disk quota."
-                )
-        if not network:
-            resource_args.append("--network=none")
         if strict_mode:
+            self._strict_expected_resources = {
+                "NanoCpus": int(cpu * 1_000_000_000),
+                "Memory": memory * 1024 * 1024,
+                "PidsLimit": int(_DEFAULT_PIDS_LIMIT),
+            }
             resource_args = [
                 "--cpus", str(cpu),
                 "--memory", f"{memory}m",
                 "--pids-limit", _DEFAULT_PIDS_LIMIT,
                 "--network=none",
             ]
+        else:
+            resource_args = []
+            if cpu > 0 and _cgroup_limits_available(image):
+                resource_args.extend(["--cpus", str(cpu)])
+            if memory > 0 and _cgroup_limits_available(image):
+                resource_args.extend(["--memory", f"{memory}m"])
+            if _cgroup_limits_available(image):
+                resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
+            if disk > 0 and sys.platform != "darwin":
+                if self._storage_opt_supported():
+                    resource_args.extend(["--storage-opt", f"size={disk}m"])
+                else:
+                    logger.warning(
+                        "Docker storage driver does not support per-container disk limits "
+                        "(requires overlay2 on XFS with pquota). Container will run without disk quota."
+                    )
+            if not network:
+                resource_args.append("--network=none")
 
         # Persistent workspace via bind mounts from a configurable host directory
         # (TERMINAL_SANDBOX_DIR, default ~/.hermes/sandboxes/). Non-persistent
@@ -1134,6 +1172,8 @@ class DockerEnvironment(BaseEnvironment):
             ]
             logger.debug(f"Starting container: {' '.join(run_cmd)}")
             try:
+                if strict_mode:
+                    self._revalidate_strict_mounts()
                 result = subprocess.run(
                     run_cmd,
                     capture_output=True,
@@ -1166,6 +1206,7 @@ class DockerEnvironment(BaseEnvironment):
                     self._strict_created_container_id = self._container_id
                     self._strict_expected_image_id = self._inspect_image_id(image)
                     self._verify_strict_container(require_running=False)
+                    self._revalidate_strict_mounts()
                     subprocess.run(
                         [self._docker_exe, "start", self._container_id],
                         capture_output=True,
@@ -1209,6 +1250,25 @@ class DockerEnvironment(BaseEnvironment):
         if not image_id.startswith("sha256:"):
             raise RuntimeError("strict Docker mode could not prove the image digest")
         return image_id
+
+    def _revalidate_strict_mounts(self) -> None:
+        """Re-prove canonical strict mount sources at every lifecycle boundary."""
+        for mount in self._strict_mounts:
+            source = Path(mount["source"])
+            try:
+                resolved = source.resolve(strict=True)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"strict mount source changed before execution: {source}"
+                ) from exc
+            if resolved != source or not source.is_dir():
+                raise RuntimeError(
+                    f"strict mount source changed before execution: {source}"
+                )
+            try:
+                _validate_strict_source_tree(source)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
 
     def _verify_strict_container(self, *, require_running: bool) -> None:
         """Fail closed unless the created container exactly matches strict policy."""
@@ -1271,7 +1331,10 @@ class DockerEnvironment(BaseEnvironment):
             failures.append("no-new-privileges")
         if host_config.get("PidMode") not in (None, ""):
             failures.append("host PID namespace")
-        if not all(int(host_config.get(key) or 0) > 0 for key in ("NanoCpus", "Memory", "PidsLimit")):
+        if any(
+            int(host_config.get(key) or 0) != expected
+            for key, expected in self._strict_expected_resources.items()
+        ):
             failures.append("resource limits")
         tmpfs = host_config.get("Tmpfs") or {}
         for target in ("/tmp", "/var/tmp", "/home", "/root", "/workspace/.git"):
@@ -1284,8 +1347,11 @@ class DockerEnvironment(BaseEnvironment):
         labels = config.get("Labels") or {}
         if labels.get("hermes-strict") != "1" or not labels.get("hermes-strict-run"):
             failures.append("strict identity labels")
-        if require_running and state.get("Running") is not True:
-            failures.append("running state")
+        if require_running:
+            if state.get("Running") is not True or state.get("Status") != "running":
+                failures.append("running state")
+        elif state.get("Running") is not False or state.get("Status") != "created":
+            failures.append("created state")
 
         if failures:
             raise RuntimeError(
@@ -1337,6 +1403,7 @@ class DockerEnvironment(BaseEnvironment):
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
         if getattr(self, "_strict_mode", False) and not self._strict_verified_pre_exec:
+            self._revalidate_strict_mounts()
             self._verify_strict_container(require_running=True)
             self._strict_verified_pre_exec = True
         cmd = [self._docker_exe, "exec"]

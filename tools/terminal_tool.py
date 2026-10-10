@@ -1193,6 +1193,20 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+def _parse_closed_bool_env(name: str, default: bool = False) -> bool:
+    """Parse an explicit true/false setting; reject ambiguous spellings."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized not in {"true", "false"}:
+        raise ValueError(
+            f"Invalid value for {name}: {raw!r} (expected true or false). "
+            f"Check ~/.hermes/.env or environment variables."
+        )
+    return normalized == "true"
+
+
 def _safe_getcwd() -> str:
     """Return the current working directory, tolerating a deleted CWD.
 
@@ -1289,9 +1303,10 @@ def _get_env_config() -> Dict[str, Any]:
         docker_extra_args = []
         docker_strict_mounts = []
 
-    docker_strict_mode = docker_backend and os.getenv(
-        "TERMINAL_DOCKER_STRICT_MODE", "false"
-    ).lower() in {"true", "1", "yes"}
+    docker_strict_mode = (
+        _parse_closed_bool_env("TERMINAL_DOCKER_STRICT_MODE")
+        if docker_backend else False
+    )
 
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, and everything else starts in the backend's default
