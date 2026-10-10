@@ -117,7 +117,7 @@ def test_strict_workspace_allows_internal_symlinks_without_following(tmp_path):
     assert mounts[0]["source"] == str(workspace.resolve())
 
 
-def test_strict_mount_allowlist_ignores_nested_socket_and_fifo(tmp_path):
+def test_strict_mount_allowlist_rejects_preexisting_socket_and_fifo(tmp_path):
     for node_type in ("socket", "fifo"):
         workspace = _workspace(tmp_path / node_type)
         node = workspace / node_type
@@ -128,10 +128,10 @@ def test_strict_mount_allowlist_ignores_nested_socket_and_fifo(tmp_path):
             sock = None
             os.mkfifo(node)
         try:
-            mounts = docker_env._normalize_strict_mounts([{
-                "source": str(workspace), "target": "/workspace", "mode": "ro",
-            }])
-            assert mounts[0]["source"] == str(workspace.resolve())
+            with pytest.raises(ValueError, match="pre-existing host IPC"):
+                docker_env._normalize_strict_mounts([{
+                    "source": str(workspace), "target": "/workspace", "mode": "ro",
+                }])
         finally:
             if sock is not None:
                 sock.close()
@@ -139,16 +139,32 @@ def test_strict_mount_allowlist_ignores_nested_socket_and_fifo(tmp_path):
 
 @pytest.mark.parametrize("mode", [stat.S_IFCHR, stat.S_IFBLK])
 def test_strict_source_tree_rejects_device_nodes(monkeypatch, tmp_path, mode):
-    class FakeEntry:
-        path = str(tmp_path / "special")
-
-        @staticmethod
-        def stat(*, follow_symlinks):
-            assert follow_symlinks is False
-            return SimpleNamespace(st_mode=mode)
-
-    monkeypatch.setattr(docker_env.os, "scandir", lambda path: [FakeEntry()])
+    real_stat = docker_env.os.stat
+    monkeypatch.setattr(docker_env.os, "listdir", lambda directory_fd: ["special"])
+    monkeypatch.setattr(
+        docker_env.os,
+        "stat",
+        lambda path, **kwargs: SimpleNamespace(st_mode=mode)
+        if path == "special"
+        else real_stat(path, **kwargs),
+    )
     with pytest.raises(ValueError, match="special node"):
+        docker_env._validate_strict_source_tree(tmp_path)
+
+
+def test_strict_source_tree_does_not_follow_swapped_directory(monkeypatch, tmp_path):
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    real_open = docker_env.os.open
+
+    def safe_open(path, flags, *args, **kwargs):
+        if path == "nested" and kwargs.get("dir_fd") is not None:
+            assert flags & docker_env._STRICT_NOFOLLOW
+            raise OSError("entry was swapped")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(docker_env.os, "open", safe_open)
+    with pytest.raises(ValueError, match="could not be opened safely"):
         docker_env._validate_strict_source_tree(tmp_path)
 
 
@@ -769,7 +785,8 @@ def test_strict_revalidates_mounts_before_every_exec(monkeypatch):
     ]
 
 
-def test_strict_mount_runtime_fifo_is_ignored_on_revalidation(tmp_path):
+@pytest.mark.parametrize("node_type", ["symlink", "fifo", "socket"])
+def test_strict_mount_runtime_artifact_is_inert_on_revalidation(tmp_path, node_type):
     workspace = _workspace(tmp_path)
     mounts = docker_env._normalize_strict_mounts([{
         "source": str(workspace), "target": "/workspace", "mode": "ro",
@@ -782,8 +799,20 @@ def test_strict_mount_runtime_fifo_is_ignored_on_revalidation(tmp_path):
     }
     docker_env.DockerEnvironment._revalidate_strict_mounts(env)
 
-    os.mkfifo(workspace / "late-fifo")
-    docker_env.DockerEnvironment._revalidate_strict_mounts(env)
+    node = workspace / f"late-{node_type}"
+    sock = None
+    if node_type == "symlink":
+        node.symlink_to(tmp_path / "outside")
+    elif node_type == "fifo":
+        os.mkfifo(node)
+    else:
+        sock = socket.socket(socket.AF_UNIX)
+        sock.bind(str(node))
+    try:
+        docker_env.DockerEnvironment._revalidate_strict_mounts(env)
+    finally:
+        if sock is not None:
+            sock.close()
 
 
 def test_strict_mount_revalidation_rejects_same_path_root_replacement(tmp_path):
@@ -1415,7 +1444,7 @@ def test_strict_cleanup_retry_after_volume_failure_is_idempotent(monkeypatch):
     with pytest.raises(RuntimeError, match="volume removal failed"):
         env.cleanup()
 
-    assert env._container_id == "container-id"
+    assert env._container_id is None
     assert env._strict_control_volume == "hermes-strict-writer-test"
 
     env.cleanup()
@@ -1423,6 +1452,68 @@ def test_strict_cleanup_retry_after_volume_failure_is_idempotent(monkeypatch):
     assert env._container_id is None
     assert env._strict_control_volume == ""
     assert volume_remove_attempts == 2
+
+
+def test_strict_cleanup_attempts_volume_after_container_failure(monkeypatch):
+    env = _volume_env()
+    env._strict_mode = True
+    env._container_id = "container-id"
+    env._persistent = False
+    env._persist_across_processes = False
+    env._workspace_dir = None
+    env._home_dir = None
+    calls = []
+
+    def teardown_container(container_id):
+        calls.append(("container", container_id))
+        raise RuntimeError("container cleanup failure")
+
+    def teardown_volume():
+        calls.append(("volume", env._strict_control_volume))
+        env._strict_control_volume = ""
+
+    monkeypatch.setattr(env, "_teardown_strict_container", teardown_container)
+    monkeypatch.setattr(env, "_teardown_strict_control_volume", teardown_volume)
+
+    with pytest.raises(RuntimeError, match="container cleanup failure"):
+        env.cleanup()
+
+    assert calls == [
+        ("container", "container-id"),
+        ("volume", "hermes-strict-writer-test"),
+    ]
+    assert env._container_id == "container-id"
+    assert env._strict_control_volume == ""
+
+
+def test_strict_cleanup_preserves_primary_when_both_teardowns_fail(monkeypatch):
+    env = _volume_env()
+    env._strict_mode = True
+    env._container_id = "container-id"
+    env._persistent = False
+    env._persist_across_processes = False
+    env._workspace_dir = None
+    env._home_dir = None
+    primary = RuntimeError("container cleanup failure")
+
+    monkeypatch.setattr(
+        env, "_teardown_strict_container", lambda container_id: (_ for _ in ()).throw(primary)
+    )
+    monkeypatch.setattr(
+        env,
+        "_teardown_strict_control_volume",
+        lambda: (_ for _ in ()).throw(RuntimeError("volume cleanup failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="container cleanup failure") as exc_info:
+        env.cleanup()
+
+    assert exc_info.value is primary
+    assert exc_info.value.__notes__ == [
+        "strict control volume cleanup also failed: volume cleanup failure"
+    ]
+    assert env._container_id == "container-id"
+    assert env._strict_control_volume == "hermes-strict-writer-test"
 
 
 def test_strict_control_volume_cleanup_accepts_verified_absence_after_timeout(monkeypatch):

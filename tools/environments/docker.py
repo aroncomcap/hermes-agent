@@ -41,9 +41,16 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _STRICT_MOUNT_TARGETS = {"/workspace", "/runtime"}
 
 
-def _validate_strict_source_tree(source: Path) -> None:
+_STRICT_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _validate_strict_source_tree(
+    source: Path, *, allow_runtime_artifacts: bool = False
+) -> None:
     """Fail closed unless *source* contains only real directories and files."""
-    _strict_source_file_inodes(source)
+    _strict_source_file_inodes(
+        source, allow_runtime_artifacts=allow_runtime_artifacts
+    )
 
 
 def _strict_source_root_identity(source: Path) -> tuple[int, int]:
@@ -59,36 +66,90 @@ def _strict_source_root_identity(source: Path) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
 
-def _strict_source_file_inodes(source: Path) -> set[tuple[int, int]]:
-    """Return regular-file inode identities for a validated strict source."""
+def _strict_source_file_inodes(
+    source: Path, *, allow_runtime_artifacts: bool = False
+) -> set[tuple[int, int]]:
+    """Return file inodes without following entries that can be swapped."""
     found: set[tuple[int, int]] = set()
-    pending = [source]
-    while pending:
-        directory = pending.pop()
-        try:
-            entries = list(os.scandir(directory))
-        except OSError as exc:
-            raise ValueError(
-                f"strict mount source could not be safely inspected: {directory}"
-            ) from exc
-        for entry in entries:
+    try:
+        root_fd = os.open(
+            source, os.O_RDONLY | os.O_DIRECTORY | _STRICT_NOFOLLOW
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"strict mount source could not be safely inspected: {source}"
+        ) from exc
+    pending: list[tuple[int, Path]] = [(root_fd, source)]
+    try:
+        while pending:
+            directory_fd, directory = pending.pop()
             try:
-                info = entry.stat(follow_symlinks=False)
-            except OSError as exc:
-                raise ValueError(
-                    f"strict mount entry could not be safely inspected: {entry.path}"
-                ) from exc
-            if stat.S_ISDIR(info.st_mode):
-                pending.append(Path(entry.path))
-            elif stat.S_ISREG(info.st_mode):
-                found.add((info.st_dev, info.st_ino))
-            elif stat.S_ISLNK(info.st_mode) or stat.S_ISFIFO(info.st_mode) or stat.S_ISSOCK(info.st_mode):
-                continue
-            else:
-                raise ValueError(
-                    "strict mount source contains a device or unsupported special node: "
-                    f"{entry.path}"
-                )
+                try:
+                    names = sorted(os.listdir(directory_fd))
+                except OSError as exc:
+                    raise ValueError(
+                        f"strict mount source could not be safely inspected: {directory}"
+                    ) from exc
+                for name in names:
+                    path = directory / name
+                    try:
+                        info = os.stat(
+                            name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                    except OSError as exc:
+                        raise ValueError(
+                            f"strict mount entry could not be safely inspected: {path}"
+                        ) from exc
+                    if stat.S_ISLNK(info.st_mode):
+                        continue
+                    if stat.S_ISFIFO(info.st_mode) or stat.S_ISSOCK(info.st_mode):
+                        if allow_runtime_artifacts:
+                            continue
+                        raise ValueError(
+                            "strict mount source contains pre-existing host IPC node: "
+                            f"{path}"
+                        )
+                    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                        raise ValueError(
+                            "strict mount source contains a device or unsupported special node: "
+                            f"{path}"
+                        )
+                    flags = os.O_RDONLY | os.O_NONBLOCK | _STRICT_NOFOLLOW
+                    if stat.S_ISDIR(info.st_mode):
+                        flags |= os.O_DIRECTORY
+                    try:
+                        child_fd = os.open(name, flags, dir_fd=directory_fd)
+                    except OSError as exc:
+                        raise ValueError(
+                            f"strict mount entry could not be opened safely: {path}"
+                        ) from exc
+                    try:
+                        opened = os.fstat(child_fd)
+                    except OSError as exc:
+                        os.close(child_fd)
+                        raise ValueError(
+                            f"strict mount entry could not be opened safely: {path}"
+                        ) from exc
+                    if (
+                        opened.st_dev,
+                        opened.st_ino,
+                        stat.S_IFMT(opened.st_mode),
+                    ) != (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)):
+                        os.close(child_fd)
+                        raise ValueError(
+                            f"strict mount entry changed while being inspected: {path}"
+                        )
+                    if stat.S_ISDIR(opened.st_mode):
+                        pending.append((child_fd, path))
+                    else:
+                        found.add((opened.st_dev, opened.st_ino))
+                        os.close(child_fd)
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        for directory_fd, _ in pending:
+            os.close(directory_fd)
+        raise
     return found
 
 
@@ -137,7 +198,9 @@ def _normalize_strict_mounts(mounts: list[dict[str, str]] | None) -> list[dict[s
     return sorted(normalized, key=lambda item: item["target"])
 
 
-def _validate_strict_mount_isolation(mounts: list[dict[str, str]]) -> None:
+def _validate_strict_mount_isolation(
+    mounts: list[dict[str, str]], *, allow_runtime_artifacts: bool = False
+) -> None:
     """Reject source aliases between writable and read-only strict mounts."""
     writable = [Path(item["source"]) for item in mounts if item["mode"] == "rw"]
     read_only = [Path(item["source"]) for item in mounts if item["mode"] == "ro"]
@@ -152,7 +215,13 @@ def _validate_strict_mount_isolation(mounts: list[dict[str, str]]) -> None:
                     "strict writable and read-only mount sources may not overlap: "
                     f"{writable_source} and {read_only_source}"
                 )
-            if _strict_source_file_inodes(writable_source) & _strict_source_file_inodes(read_only_source):
+            if _strict_source_file_inodes(
+                writable_source,
+                allow_runtime_artifacts=allow_runtime_artifacts,
+            ) & _strict_source_file_inodes(
+                read_only_source,
+                allow_runtime_artifacts=allow_runtime_artifacts,
+            ):
                 raise ValueError(
                     "strict writable and read-only mount sources may not share file inodes: "
                     f"{writable_source} and {read_only_source}"
@@ -1628,12 +1697,16 @@ class DockerEnvironment(BaseEnvironment):
                     f"strict mount source changed before execution: {source}"
                 )
             try:
-                _validate_strict_source_tree(source)
+                _validate_strict_source_tree(
+                    source, allow_runtime_artifacts=True
+                )
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
             revalidated.append({**mount, "source": str(resolved)})
         try:
-            _validate_strict_mount_isolation(revalidated)
+            _validate_strict_mount_isolation(
+                revalidated, allow_runtime_artifacts=True
+            )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
 
@@ -2173,10 +2246,25 @@ class DockerEnvironment(BaseEnvironment):
             should_remove = True
 
         if self._strict_mode and should_remove:
-            self._teardown_strict_container(container_id)
+            cleanup_error: Exception | None = None
+            try:
+                self._teardown_strict_container(container_id)
+            except Exception as exc:
+                cleanup_error = exc
+            else:
+                self._container_id = None
             if getattr(self, "_strict_control_volume", ""):
-                self._teardown_strict_control_volume()
-            self._container_id = None
+                try:
+                    self._teardown_strict_control_volume()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                    else:
+                        cleanup_error.add_note(
+                            f"strict control volume cleanup also failed: {exc}"
+                        )
+            if cleanup_error is not None:
+                raise cleanup_error
             if not self._persistent:
                 for d in (self._workspace_dir, self._home_dir):
                     if d:

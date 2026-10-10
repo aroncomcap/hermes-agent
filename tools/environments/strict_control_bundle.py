@@ -35,16 +35,71 @@ def _sealed_file_mode(mode: int) -> int:
 
 def _inodes(root: Path) -> set[tuple[int, int]]:
     found = set()
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                info = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    pending.append(Path(entry.path))
-                if stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode):
-                    found.add((info.st_dev, info.st_ino))
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+    except OSError as exc:
+        raise ValueError(f"workspace could not be safely inspected: {root}") from exc
+    pending: list[tuple[int, Path]] = [(root_fd, root)]
+    try:
+        while pending:
+            directory_fd, directory = pending.pop()
+            try:
+                try:
+                    names = sorted(os.listdir(directory_fd))
+                except OSError as exc:
+                    raise ValueError(
+                        f"workspace could not be safely inspected: {directory}"
+                    ) from exc
+                for name in names:
+                    path = directory / name
+                    try:
+                        info = os.stat(
+                            name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                    except OSError as exc:
+                        raise ValueError(
+                            f"workspace entry could not be safely inspected: {path}"
+                        ) from exc
+                    if stat.S_ISLNK(info.st_mode) or not (
+                        stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+                    ):
+                        continue
+                    flags = os.O_RDONLY | os.O_NONBLOCK | NOFOLLOW
+                    if stat.S_ISDIR(info.st_mode):
+                        flags |= os.O_DIRECTORY
+                    try:
+                        child_fd = os.open(name, flags, dir_fd=directory_fd)
+                    except OSError as exc:
+                        raise ValueError(
+                            f"workspace entry could not be opened safely: {path}"
+                        ) from exc
+                    try:
+                        opened = os.fstat(child_fd)
+                    except OSError as exc:
+                        os.close(child_fd)
+                        raise ValueError(
+                            f"workspace entry could not be opened safely: {path}"
+                        ) from exc
+                    if (
+                        opened.st_dev,
+                        opened.st_ino,
+                        stat.S_IFMT(opened.st_mode),
+                    ) != (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)):
+                        os.close(child_fd)
+                        raise ValueError(
+                            f"workspace entry changed while being inspected: {path}"
+                        )
+                    found.add((opened.st_dev, opened.st_ino))
+                    if stat.S_ISDIR(opened.st_mode):
+                        pending.append((child_fd, path))
+                    else:
+                        os.close(child_fd)
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        for directory_fd, _ in pending:
+            os.close(directory_fd)
+        raise
     return found
 
 

@@ -5,6 +5,7 @@ import tarfile
 
 import pytest
 
+from tools.environments import strict_control_bundle
 from tools.environments.strict_control_bundle import (
     load_control_bundle,
     verify_control_bundle_archive,
@@ -91,6 +92,22 @@ def test_rejects_workspace_hardlink_alias(tmp_path):
     original.write_text("content")
     os.link(original, control / "alias")
     with pytest.raises(ValueError, match="aliases workspace inode|hardlink aliases"):
+        load_control_bundle(control, workspace)
+
+
+def test_workspace_inode_scan_does_not_follow_swapped_directory(monkeypatch, tmp_path):
+    workspace, control = roots(tmp_path)
+    (workspace / "nested").mkdir()
+    real_open = strict_control_bundle.os.open
+
+    def safe_open(path, flags, *args, **kwargs):
+        if path == "nested" and kwargs.get("dir_fd") is not None:
+            assert flags & strict_control_bundle.NOFOLLOW
+            raise OSError("entry was swapped")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(strict_control_bundle.os, "open", safe_open)
+    with pytest.raises(ValueError, match="workspace entry could not be opened safely"):
         load_control_bundle(control, workspace)
 
 
