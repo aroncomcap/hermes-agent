@@ -2,6 +2,8 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from hermes_cli.nous_account import NousPortalAccountInfo
 from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
@@ -58,6 +60,23 @@ class TestOpenRouterModels:
 
 
 class TestFetchOpenRouterModels:
+    @pytest.fixture(autouse=True)
+    def _isolate_curated_catalog(self, monkeypatch):
+        """Baseline assertions use the in-repo snapshot, not the published manifest.
+
+        ``fetch_openrouter_models`` treats ``get_curated_openrouter_models()`` as
+        an allowlist and, on a ``/v1/models`` failure, returns that manifest
+        instead of ``OPENROUTER_MODELS``. The published manifest changes without
+        a release (it dropped ``qwen/qwen3.7-max`` while this snapshot still
+        lists it), so an unpinned test fails or passes with the network.
+        Tests that need a specific manifest override this stub inside the test.
+        """
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        monkeypatch.setattr(
+            "hermes_cli.model_catalog.get_curated_openrouter_models",
+            lambda: None,
+        )
+
     def test_live_fetch_recomputes_free_tags(self, monkeypatch):
         class _Resp:
             def __enter__(self):
@@ -170,6 +189,64 @@ class TestFetchOpenRouterModels:
         ids = [mid for mid, _ in models]
         assert "anthropic/claude-opus-4.8" in ids
         assert "qwen/qwen3.7-max" in ids
+
+    def test_curated_allowlist_hides_models_missing_from_manifest(self, monkeypatch):
+        """A live payload must not resurrect a model the curated manifest omitted.
+
+        Missing ``supported_parameters`` stays permissive only for ids the
+        allowlist already names. Tool-support filtering is unchanged: an
+        explicit list that omits ``tools`` is still dropped, and this test
+        does not widen the allowlist.
+        """
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    b'{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},'
+                    b'{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"},'
+                    b'"supported_parameters":["tools","temperature"]},'
+                    b'{"id":"google/gemini-3-pro-image-preview","pricing":{"prompt":"0.00001","completion":"0.00003"},'
+                    b'"supported_parameters":["temperature","response_format"]}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with (
+            patch(
+                "hermes_cli.model_catalog.get_curated_openrouter_models",
+                return_value=[
+                    ("anthropic/claude-opus-4.8", ""),
+                    ("google/gemini-3-pro-image-preview", ""),
+                ],
+            ),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
+        ):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        ids = [mid for mid, _ in models]
+        assert ids == ["anthropic/claude-opus-4.8"]
+
+    def test_fetch_failure_prefers_curated_manifest_over_static_snapshot(self, monkeypatch):
+        """A reachable curated manifest wins when the live model fetch fails."""
+        curated = [("anthropic/claude-opus-4.8", "pinned")]
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with (
+            patch(
+                "hermes_cli.model_catalog.get_curated_openrouter_models",
+                return_value=list(curated),
+            ),
+            patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=OSError("boom")),
+        ):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        assert models == curated
+        assert models != OPENROUTER_MODELS
 
 
 class TestOpenRouterToolSupportHelper:
