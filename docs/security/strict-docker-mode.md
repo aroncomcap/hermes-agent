@@ -36,15 +36,18 @@ For a reviewer, set the `/workspace` mount to `ro`. `/runtime`, when present,
 is always read-only. Strict mode rejects ordinary Docker volumes, forwarded or
 explicit environment variables, raw Docker arguments, automatic CWD mounts,
 persistent filesystems, container reuse, networking, root users, missing
-resource limits, symlinked sources, and mount targets outside `/workspace` and
-`/runtime`. Activation also fails unless `docker info` reports the daemon's
-`name=rootless` security option.
+resource limits, symlinks or special filesystem nodes anywhere in a mount,
+and mount targets outside `/workspace` and `/runtime`. The strict-mode setting
+accepts only explicit `true` or `false` values. Activation also fails unless
+`docker info` reports the daemon's `name=rootless` security option.
 
 Before the first tool command, Hermes creates a fresh stopped container and
 checks its immutable image ID, exact bind mounts, network namespace, non-root
 user, capabilities, no-new-privileges, read-only root filesystem, tmpfs masks,
 resource limits, run label, and container identity. Any mismatch aborts before
-execution and removes the container.
+execution and removes the container. Mount sources are scanned again before
+create, start, and the first exec so a late socket, device, FIFO, or symlink
+also fails closed.
 
 ## Rehearse without a model
 
