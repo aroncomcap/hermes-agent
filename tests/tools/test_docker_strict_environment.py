@@ -104,7 +104,20 @@ def test_strict_mount_allowlist_rejects_symlink_source(tmp_path):
         ])
 
 
-def test_strict_mount_allowlist_rejects_nested_socket_and_fifo(tmp_path):
+def test_strict_workspace_allows_internal_symlinks_without_following(tmp_path):
+    workspace = _workspace(tmp_path)
+    outside = tmp_path / "outside"
+    outside.write_text("host-only")
+    (workspace / "external-link").symlink_to(outside)
+
+    mounts = docker_env._normalize_strict_mounts([{
+        "source": str(workspace), "target": "/workspace", "mode": "rw",
+    }])
+
+    assert mounts[0]["source"] == str(workspace.resolve())
+
+
+def test_strict_mount_allowlist_ignores_nested_socket_and_fifo(tmp_path):
     for node_type in ("socket", "fifo"):
         workspace = _workspace(tmp_path / node_type)
         node = workspace / node_type
@@ -115,17 +128,17 @@ def test_strict_mount_allowlist_rejects_nested_socket_and_fifo(tmp_path):
             sock = None
             os.mkfifo(node)
         try:
-            with pytest.raises(ValueError, match="special node"):
-                docker_env._normalize_strict_mounts([{
-                    "source": str(workspace), "target": "/workspace", "mode": "ro",
-                }])
+            mounts = docker_env._normalize_strict_mounts([{
+                "source": str(workspace), "target": "/workspace", "mode": "ro",
+            }])
+            assert mounts[0]["source"] == str(workspace.resolve())
         finally:
             if sock is not None:
                 sock.close()
 
 
-@pytest.mark.parametrize("mode", [stat.S_IFSOCK, stat.S_IFIFO, stat.S_IFCHR, stat.S_IFBLK])
-def test_strict_source_tree_rejects_every_special_node_kind(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize("mode", [stat.S_IFCHR, stat.S_IFBLK])
+def test_strict_source_tree_rejects_device_nodes(monkeypatch, tmp_path, mode):
     class FakeEntry:
         path = str(tmp_path / "special")
 
@@ -568,6 +581,7 @@ def _strict_cleanup_env() -> docker_env.DockerEnvironment:
     env._persist_across_processes = False
     env._workspace_dir = None
     env._home_dir = None
+    env._strict_control_volume = ""
     return env
 
 
@@ -598,7 +612,7 @@ def test_strict_cleanup_propagates_lifecycle_failures_and_retains_handle(
     def fake_run(args, **kwargs):
         calls.append(args[1])
         if args[1] == "inspect":
-            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+            return SimpleNamespace(returncode=0, stdout="[{}]", stderr="")
         return SimpleNamespace(
             returncode=1 if args[1] == failed_action else 0,
             stdout="",
@@ -645,7 +659,26 @@ def test_strict_cleanup_rejects_container_that_still_exists(monkeypatch):
     assert env._container_id == "container-id"
 
 
-def test_strict_init_failure_triggers_verified_teardown(monkeypatch, tmp_path):
+def test_strict_cleanup_removes_surviving_volume_without_container_handle(monkeypatch):
+    env = _strict_cleanup_env()
+    env._container_id = None
+    env._strict_control_volume = "control-volume"
+    calls = []
+
+    def teardown_volume():
+        calls.append("volume")
+        env._strict_control_volume = ""
+
+    monkeypatch.setattr(env, "_teardown_strict_control_volume", teardown_volume)
+
+    env.cleanup()
+
+    assert calls == ["volume"]
+    assert env._strict_control_volume == ""
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_strict_init_failure_triggers_verified_teardown(monkeypatch, tmp_path, cleanup_failure):
     workspace = _workspace(tmp_path)
     payload = _inspect_payload(workspace)
     payload["Mounts"][0]["Source"] = str(workspace.resolve())
@@ -678,13 +711,15 @@ def test_strict_init_failure_triggers_verified_teardown(monkeypatch, tmp_path):
         if args[1] in {"start", "stop"}:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if args[1:3] == ["rm", "-f"]:
+            if cleanup_failure:
+                return SimpleNamespace(stdout="", stderr="remove failed", returncode=1)
             removed = True
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         pytest.fail(f"unexpected lifecycle command: {args}")
 
     monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
 
-    with pytest.raises(RuntimeError, match="post-start inspection failed"):
+    with pytest.raises(RuntimeError, match="post-start inspection failed") as exc_info:
         docker_env.DockerEnvironment(
             image="strict-image",
             cwd="/workspace",
@@ -699,6 +734,10 @@ def test_strict_init_failure_triggers_verified_teardown(monkeypatch, tmp_path):
             }],
         )
 
+    if cleanup_failure:
+        assert exc_info.value.__notes__ == [
+            "strict Docker initialization cleanup also failed: strict Docker teardown failed: docker rm exited 1; container still exists after removal"
+        ]
     assert commands[-3:] == ["stop", "rm", "inspect"]
 
 
@@ -730,18 +769,40 @@ def test_strict_revalidates_mounts_before_every_exec(monkeypatch):
     ]
 
 
-def test_strict_mount_race_is_rejected_on_revalidation(tmp_path):
+def test_strict_mount_runtime_fifo_is_ignored_on_revalidation(tmp_path):
     workspace = _workspace(tmp_path)
     mounts = docker_env._normalize_strict_mounts([{
         "source": str(workspace), "target": "/workspace", "mode": "ro",
     }])
     env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
     env._strict_mounts = mounts
+    env._strict_mount_source_identities = {
+        mount["target"]: docker_env._strict_source_root_identity(Path(mount["source"]))
+        for mount in mounts
+    }
     docker_env.DockerEnvironment._revalidate_strict_mounts(env)
 
     os.mkfifo(workspace / "late-fifo")
-    with pytest.raises(RuntimeError, match="special node"):
-        docker_env.DockerEnvironment._revalidate_strict_mounts(env)
+    docker_env.DockerEnvironment._revalidate_strict_mounts(env)
+
+
+def test_strict_mount_revalidation_rejects_same_path_root_replacement(tmp_path):
+    workspace = _workspace(tmp_path)
+    mounts = docker_env._normalize_strict_mounts([{
+        "source": str(workspace), "target": "/workspace", "mode": "ro",
+    }])
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env._strict_mounts = mounts
+    env._strict_mount_source_identities = {
+        mount["target"]: docker_env._strict_source_root_identity(Path(mount["source"]))
+        for mount in mounts
+    }
+
+    workspace.rename(tmp_path / "original-workspace")
+    _workspace(tmp_path)
+
+    with pytest.raises(RuntimeError, match="source changed"):
+        env._revalidate_strict_mounts()
 
 
 def test_strict_mount_overlap_is_rejected_on_revalidation(tmp_path):
@@ -753,6 +814,10 @@ def test_strict_mount_overlap_is_rejected_on_revalidation(tmp_path):
         {"source": str(workspace.resolve()), "target": "/workspace", "mode": "rw"},
         {"source": str(runtime.resolve()), "target": "/runtime", "mode": "ro"},
     ]
+    env._strict_mount_source_identities = {
+        mount["target"]: docker_env._strict_source_root_identity(Path(mount["source"]))
+        for mount in env._strict_mounts
+    }
 
     with pytest.raises(RuntimeError, match="may not overlap"):
         env._revalidate_strict_mounts()
@@ -770,6 +835,10 @@ def test_strict_mount_hardlink_alias_is_rejected_on_revalidation(tmp_path):
         {"source": str(workspace.resolve()), "target": "/workspace", "mode": "rw"},
         {"source": str(runtime.resolve()), "target": "/runtime", "mode": "ro"},
     ]
+    env._strict_mount_source_identities = {
+        mount["target"]: docker_env._strict_source_root_identity(Path(mount["source"]))
+        for mount in env._strict_mounts
+    }
 
     with pytest.raises(RuntimeError, match="share file inodes"):
         env._revalidate_strict_mounts()
@@ -862,6 +931,7 @@ def _volume_env():
     env._strict_control_bundle = SimpleNamespace(manifest_digest="a" * 64, archive=b"tar")
     env._strict_expected_control_manifest_digest = "a" * 64
     env._strict_helper_label = "helper-label"
+    env._strict_expected_user = "1000:1000"
     env._strict_expected_resources = {"NanoCpus": 1_000_000_000, "Memory": 536_870_912, "PidsLimit": 256}
     return env
 
@@ -908,7 +978,7 @@ def test_strict_control_volume_rejects_driver_options(monkeypatch):
         env._verify_strict_control_volume()
 
 
-def _assert_constrained_helper_run(args, *, readonly: bool):
+def _assert_constrained_helper_run(args, *, readonly: bool, user_spec: str):
     assert args[:4] == ["docker", "run", "--name", args[3]]
     assert args[3].startswith("hermes-strict-helper-")
     for expected in (
@@ -917,16 +987,18 @@ def _assert_constrained_helper_run(args, *, readonly: bool):
         "--label", "hermes-strict-lane=writer",
         "--label", f"hermes-strict-manifest={'a' * 64}",
         "--network=none",
+        "-i",
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--read-only",
         "--cpus", "1",
         "--memory", "512m",
         "--pids-limit", "256",
-        "--user", "0:0",
+        "--user",
         "--entrypoint", "tar",
     ):
         assert expected in args
+    assert args[args.index("--user") + 1] == user_spec
     mount = f"type=volume,src=hermes-strict-writer-test,dst=/runtime{',readonly' if readonly else ''}"
     assert mount in args
 
@@ -940,7 +1012,7 @@ def test_strict_control_volume_readback_uses_constrained_helper(monkeypatch):
     def fake_run(args, **kwargs):
         calls.append(args)
         if args[:2] == ["docker", "run"]:
-            _assert_constrained_helper_run(args, readonly=True)
+            _assert_constrained_helper_run(args, readonly=True, user_spec="1000:1000")
             assert args[-6:] == ["candidate-image", "-C", "/runtime", "-cf", "-", "."]
             return SimpleNamespace(returncode=0, stdout=b"archive", stderr="")
         if args[:2] == ["docker", "inspect"]:
@@ -971,7 +1043,7 @@ def test_strict_control_volume_populate_uses_constrained_helper(monkeypatch):
                 return SimpleNamespace(returncode=1, stdout="", stderr="No such volume")
             return SimpleNamespace(returncode=0, stdout=json.dumps([_volume_payload()]), stderr="")
         if args[:2] == ["docker", "run"]:
-            _assert_constrained_helper_run(args, readonly=False)
+            _assert_constrained_helper_run(args, readonly=False, user_spec="0:0")
             assert kwargs["input"] == b"tar"
             assert args[-5:] == ["candidate-image", "-xf", "-", "-C", "/runtime"]
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1008,6 +1080,7 @@ def test_strict_control_helper_timeout_removes_residue(monkeypatch):
             "candidate-image",
             "type=volume,src=hermes-strict-writer-test,dst=/runtime,readonly",
             ["-C", "/runtime", "-cf", "-", "."],
+            user_spec="1000:1000",
         )
 
     assert any(call[:3] == ["docker", "rm", "-f"] for call in calls)
@@ -1029,6 +1102,7 @@ def test_strict_control_helper_cleanup_fails_closed_on_residue(monkeypatch):
             "candidate-image",
             "type=volume,src=hermes-strict-writer-test,dst=/runtime,readonly",
             ["-C", "/runtime", "-cf", "-", "."],
+            user_spec="1000:1000",
         )
 
 
@@ -1049,6 +1123,7 @@ def test_strict_control_helper_preserves_primary_error_with_cleanup_diagnostic(m
             "candidate-image",
             "type=volume,src=hermes-strict-writer-test,dst=/runtime,readonly",
             ["-C", "/runtime", "-cf", "-", "."],
+            user_spec="1000:1000",
         )
 
     assert exc_info.value.__notes__ == [
@@ -1057,7 +1132,36 @@ def test_strict_control_helper_preserves_primary_error_with_cleanup_diagnostic(m
     ]
 
 
-def test_strict_lifecycle_cleans_volume_after_post_create_revalidation_failure(monkeypatch, tmp_path):
+def test_strict_control_volume_preserves_primary_error_when_teardown_fails(monkeypatch):
+    env = _volume_env()
+
+    def fake_run(args, **kwargs):
+        if args[:3] == ["docker", "volume", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such volume")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        env,
+        "_verify_strict_control_volume",
+        lambda: (_ for _ in ()).throw(RuntimeError("primary volume failure")),
+    )
+    monkeypatch.setattr(
+        env,
+        "_teardown_strict_control_volume",
+        lambda: (_ for _ in ()).throw(RuntimeError("volume cleanup failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="primary volume failure") as exc_info:
+        env._create_strict_control_volume("candidate-image")
+
+    assert exc_info.value.__notes__ == [
+        "strict control volume cleanup also failed: volume cleanup failure"
+    ]
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_strict_lifecycle_cleans_volume_after_post_create_revalidation_failure(monkeypatch, tmp_path, cleanup_failure):
     workspace = _workspace(tmp_path)
     control = tmp_path / "control"
     control.mkdir()
@@ -1075,23 +1179,49 @@ def test_strict_lifecycle_cleans_volume_after_post_create_revalidation_failure(m
         "_create_strict_control_volume",
         lambda self, image: calls.append("create-volume") or setattr(self, "_strict_control_volume", "vol"),
     )
+    revalidations = []
+
+    def revalidate(self):
+        revalidations.append("revalidate")
+        if len(revalidations) == 2:
+            raise RuntimeError("post-create drift")
+
     monkeypatch.setattr(
-        docker_env.DockerEnvironment,
-        "_revalidate_strict_mounts",
-        lambda self: (_ for _ in ()).throw(RuntimeError("post-create drift")),
+        docker_env.DockerEnvironment, "_revalidate_strict_mounts", revalidate,
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_verify_strict_container", lambda self, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_verify_strict_control_volume", lambda self: None,
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_inspect_image_id", lambda self, image: "sha256:image",
     )
     monkeypatch.setattr(
         docker_env.DockerEnvironment,
-        "_teardown_strict_control_volume",
-        lambda self: calls.append("teardown-volume") or setattr(self, "_strict_control_volume", ""),
-    )
-    monkeypatch.setattr(
-        docker_env.subprocess,
-        "run",
-        lambda args, **kwargs: calls.append(args) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        "_teardown_strict_container",
+        lambda self, container_id: calls.append("teardown-container"),
     )
 
-    with pytest.raises(RuntimeError, match="post-create drift"):
+    def teardown_volume(self):
+        calls.append("teardown-volume")
+        if cleanup_failure:
+            raise RuntimeError("volume cleanup failure")
+        self._strict_control_volume = ""
+
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment, "_teardown_strict_control_volume", teardown_volume,
+    )
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        stdout = "container-id\n" if args[1] == "create" else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="post-create drift") as exc_info:
         docker_env.DockerEnvironment(
             image="unused",
             cwd="/workspace",
@@ -1109,7 +1239,66 @@ def test_strict_lifecycle_cleans_volume_after_post_create_revalidation_failure(m
 
     assert "create-volume" in calls
     assert "teardown-volume" in calls
-    assert ["docker", "rm", "-f"] == next(call[:3] for call in calls if isinstance(call, list) and call[:3] == ["docker", "rm", "-f"])
+    assert "teardown-container" in calls
+    if cleanup_failure:
+        assert exc_info.value.__notes__ == [
+            "strict Docker lifecycle cleanup also failed: volume cleanup failure"
+        ]
+
+
+def test_strict_container_create_preserves_primary_error_when_volume_cleanup_fails(monkeypatch, tmp_path):
+    workspace = _workspace(tmp_path)
+    control = tmp_path / "control"
+    control.mkdir()
+    (control / "policy.txt").write_text("trusted", encoding="utf-8")
+    digest = docker_env.load_control_bundle(control, workspace).manifest_digest
+
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: "1000:1000")
+    monkeypatch.setattr(docker_env, "_ensure_docker_available", lambda: None)
+    monkeypatch.setattr(docker_env, "_rootless_docker_available", lambda: True)
+    monkeypatch.setattr(docker_env, "_image_uses_init_entrypoint", lambda docker, image: False)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "docker")
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_create_strict_control_volume",
+        lambda self, image: setattr(self, "_strict_control_volume", "vol"),
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_revalidate_strict_mounts",
+        lambda self: (_ for _ in ()).throw(RuntimeError("primary create failure")),
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_teardown_strict_control_volume",
+        lambda self: (_ for _ in ()).throw(RuntimeError("outer cleanup failure")),
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_teardown_strict_container",
+        lambda self, name: (_ for _ in ()).throw(RuntimeError("container cleanup failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="primary create failure") as exc_info:
+        docker_env.DockerEnvironment(
+            image="unused",
+            cwd="/workspace",
+            cpu=1,
+            memory=128,
+            network=False,
+            run_as_host_user=True,
+            persist_across_processes=False,
+            strict_mode=True,
+            strict_mounts=[{"source": str(workspace), "target": "/workspace", "mode": "rw"}],
+            strict_control_source=str(control),
+            strict_control_lane="writer",
+            strict_control_manifest_digest=digest,
+        )
+
+    assert exc_info.value.__notes__ == [
+        "strict Docker create cleanup also failed: container cleanup failure",
+        "strict Docker create cleanup also failed: outer cleanup failure",
+    ]
 
 
 def test_strict_control_source_requires_shared_manifest_match(monkeypatch, tmp_path):
@@ -1190,6 +1379,71 @@ def test_strict_container_rejects_control_volume_substitution(monkeypatch, tmp_p
     env._strict_expected_user = "1000:1000"
     with pytest.raises(RuntimeError, match="mount allowlist"):
         env._verify_strict_container(require_running=True)
+
+
+def test_strict_cleanup_retry_after_volume_failure_is_idempotent(monkeypatch):
+    env = _volume_env()
+    env._strict_mode = True
+    env._container_id = "container-id"
+    env._persistent = False
+    env._persist_across_processes = False
+    env._workspace_dir = None
+    env._home_dir = None
+    volume_remove_attempts = 0
+
+    def fake_run(args, **kwargs):
+        nonlocal volume_remove_attempts
+        if args[:3] == ["docker", "volume", "rm"]:
+            volume_remove_attempts += 1
+            if volume_remove_attempts == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="volume is in use")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:3] == ["docker", "volume", "inspect"]:
+            if volume_remove_attempts == 1:
+                return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such volume")
+        if args[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+        if args[:2] in (["docker", "stop"], ["docker", "rm"]):
+            if volume_remove_attempts == 0:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="volume removal failed"):
+        env.cleanup()
+
+    assert env._container_id == "container-id"
+    assert env._strict_control_volume == "hermes-strict-writer-test"
+
+    env.cleanup()
+
+    assert env._container_id is None
+    assert env._strict_control_volume == ""
+    assert volume_remove_attempts == 2
+
+
+def test_strict_control_volume_cleanup_accepts_verified_absence_after_timeout(monkeypatch):
+    env = _volume_env()
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["docker", "volume", "rm"]:
+            raise docker_env.subprocess.TimeoutExpired(args, timeout=30)
+        return SimpleNamespace(returncode=1, stdout="", stderr="No such volume")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", run)
+
+    env._teardown_strict_control_volume()
+
+    assert calls == [
+        ["docker", "volume", "rm", "hermes-strict-writer-test"],
+        ["docker", "volume", "inspect", "hermes-strict-writer-test"],
+    ]
+    assert env._strict_control_volume == ""
 
 
 def test_strict_control_volume_cleanup_verifies_exact_absence(monkeypatch):

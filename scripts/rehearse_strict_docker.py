@@ -59,6 +59,7 @@ def main() -> None:
             subprocess.run(["git", "init", "-q", str(workspace)], check=True)
             (workspace / "visible.txt").write_text("workspace", encoding="utf-8")
             (control / "control.txt").write_text("control", encoding="utf-8")
+            (control / "control.txt").chmod(0o400)
 
             link = root_path / "workspace-link"
             link.symlink_to(workspace, target_is_directory=True)
@@ -100,6 +101,7 @@ def main() -> None:
 set -eu
 test -f /workspace/visible.txt
 test -f /runtime/control.txt
+test "$(cat /runtime/control.txt)" = control
 test ! -e /workspace/.git/HEAD
 test ! -e /var/run/docker.sock
 test ! -e /root/.ssh
@@ -133,6 +135,7 @@ printf ok > /workspace/writer-proof.txt
 set -eu
 test -f /workspace/writer-proof.txt
 test -f /runtime/control.txt
+test "$(cat /runtime/control.txt)" = control
 ! touch /workspace/reviewer-must-fail
 ! touch /runtime/reviewer-must-fail
 """)

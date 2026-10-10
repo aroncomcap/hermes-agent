@@ -29,6 +29,10 @@ def _path(name: str) -> PurePosixPath:
     return path
 
 
+def _sealed_file_mode(mode: int) -> int:
+    return 0o444 | (mode & 0o111)
+
+
 def _inodes(root: Path) -> set[tuple[int, int]]:
     found = set()
     pending = [root]
@@ -93,7 +97,7 @@ def load_control_bundle(source: str | Path, workspace: str | Path) -> ControlBun
         raise ValueError("control source must be a real directory")
     directories, files = _read_tree(source, _inodes(Path(workspace)))
     manifest = {"version": 1, "files": [
-        {"path": path, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "mode": mode & 0o777}
+        {"path": path, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "mode": _sealed_file_mode(mode)}
         for path, (data, mode) in sorted(files.items())
     ]}
     manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
@@ -106,7 +110,7 @@ def load_control_bundle(source: str | Path, workspace: str | Path) -> ControlBun
             archive.addfile(info)
         for path, (data, mode) in sorted(files.items()):
             info = tarfile.TarInfo(path)
-            info.size, info.mode = len(data), mode & 0o555
+            info.size, info.mode = len(data), _sealed_file_mode(mode)
             archive.addfile(info, io.BytesIO(data))
         info = tarfile.TarInfo(MANIFEST)
         info.size, info.mode = len(manifest_bytes), 0o444
@@ -117,7 +121,7 @@ def load_control_bundle(source: str | Path, workspace: str | Path) -> ControlBun
 
 
 def verify_control_bundle_archive(archive_bytes: bytes, expected_digest: str) -> dict[str, bytes]:
-    files, manifest_bytes, seen = {}, None, set()
+    files, file_modes, manifest_bytes, seen = {}, {}, None, set()
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             for member in archive.getmembers():
@@ -133,11 +137,18 @@ def verify_control_bundle_archive(archive_bytes: bytes, expected_digest: str) ->
                 if member.isdir():
                     if member.mode & 0o222:
                         raise ValueError(f"control bundle entry is writable: {name}")
+                    if member.mode & 0o555 != 0o555:
+                        raise ValueError(
+                            f"control bundle directory is not runtime-readable: {name}"
+                        )
                     continue
                 if not member.isfile() or member.issym() or member.islnk():
                     raise ValueError(f"control bundle contains link or special node: {name}")
                 if member.mode & 0o222:
                     raise ValueError(f"control bundle entry is writable: {name}")
+                if member.mode & 0o444 != 0o444:
+                    raise ValueError(f"control bundle entry is not runtime-readable: {name}")
+                file_modes[name] = member.mode & 0o777
                 extracted = archive.extractfile(member)
                 if extracted is None:
                     raise ValueError(f"control bundle file unreadable: {name}")
@@ -160,6 +171,16 @@ def verify_control_bundle_archive(archive_bytes: bytes, expected_digest: str) ->
         if name in expected_paths:
             raise ValueError(f"duplicate control bundle manifest path: {name}")
         expected_paths.add(name)
+        mode = entry.get("mode")
+        if (
+            not isinstance(mode, int)
+            or mode & 0o222
+            or mode & 0o444 != 0o444
+            or mode & ~0o555
+        ):
+            raise ValueError(f"control bundle manifest mode is invalid: {name}")
+        if file_modes.get(name) != mode:
+            raise ValueError(f"control bundle file mode drift: {name}")
         data = files.get(name)
         if data is None or len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
             raise ValueError(f"control bundle content digest drift: {name}")
