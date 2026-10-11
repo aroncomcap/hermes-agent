@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import socket
 import stat
 from pathlib import Path
@@ -584,6 +585,11 @@ def test_strict_revalidates_mounts_before_create_and_start(monkeypatch, tmp_path
             return SimpleNamespace(stdout=json.dumps([payload]), returncode=0)
         if args[1] == "start":
             return SimpleNamespace(stdout="", returncode=0)
+        if args[1] == "exec":
+            identity = docker_env._strict_source_root_identity(workspace)
+            return SimpleNamespace(
+                stdout=f"{identity[0]}:{identity[1]}\n", returncode=0
+            )
         if args[1] == "stop":
             return SimpleNamespace(stdout="", returncode=0)
         if args[1:3] == ["rm", "-f"]:
@@ -612,6 +618,88 @@ def test_strict_revalidates_mounts_before_create_and_start(monkeypatch, tmp_path
     assert env._strict_expected_user == "1000:1000"
     env.cleanup()
     assert env._container_id is None
+
+
+def test_strict_start_rejects_bound_inode_after_parent_directory_swap(
+    monkeypatch, tmp_path
+):
+    mount_parent = tmp_path / "mount-parent"
+    workspace = _workspace(mount_parent)
+    expected_identity = docker_env._strict_source_root_identity(workspace)
+    payload = _inspect_payload(workspace)
+    payload["Mounts"][0]["Source"] = str(workspace.resolve())
+    payload["State"] = {"Running": False, "Status": "created"}
+    removed = False
+    create_source = ""
+    bound_identity = expected_identity
+
+    monkeypatch.setattr(docker_env, "_resolve_host_user_spec", lambda: "1000:1000")
+    monkeypatch.setattr(docker_env, "_ensure_docker_available", lambda: None)
+    monkeypatch.setattr(docker_env, "_rootless_docker_available", lambda: True)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "docker")
+    monkeypatch.setattr(docker_env, "_image_uses_init_entrypoint", lambda *args: False)
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
+
+    def fake_run(args, **kwargs):
+        nonlocal bound_identity, create_source, removed
+        if args[1] == "create":
+            mount_spec = args[args.index("--mount") + 1]
+            fields = dict(
+                field.split("=", 1)
+                for field in mount_spec.split(",")
+                if "=" in field
+            )
+            create_source = fields["src"]
+            assert create_source == str(workspace.resolve())
+            return SimpleNamespace(stdout="container-id\n", returncode=0)
+        if args[1] == "start":
+            original_parent = tmp_path / "original-mount-parent"
+            mount_parent.rename(original_parent)
+            replacement = _workspace(mount_parent)
+            try:
+                bound_identity = docker_env._strict_source_root_identity(replacement)
+                assert bound_identity != expected_identity
+            finally:
+                shutil.rmtree(mount_parent)
+                original_parent.rename(mount_parent)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if args[1] == "exec":
+            return SimpleNamespace(
+                stdout=f"{bound_identity[0]}:{bound_identity[1]}\n",
+                stderr="",
+                returncode=0,
+            )
+        if args[1:3] == ["image", "inspect"]:
+            return SimpleNamespace(stdout="sha256:image-id\n", returncode=0)
+        if args[1] == "inspect":
+            if removed:
+                return SimpleNamespace(stdout="", stderr="No such container", returncode=1)
+            return SimpleNamespace(stdout=json.dumps([payload]), returncode=0)
+        if args[1] == "stop":
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if args[1:3] == ["rm", "-f"]:
+            removed = True
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        pytest.fail(f"unexpected lifecycle command: {args}")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="bound the wrong source inode"):
+        docker_env.DockerEnvironment(
+            image="strict-image",
+            cwd="/workspace",
+            cpu=1,
+            memory=512,
+            network=False,
+            run_as_host_user=True,
+            persist_across_processes=False,
+            strict_mode=True,
+            strict_mounts=[{
+                "source": str(workspace), "target": "/workspace", "mode": "ro",
+            }],
+        )
+
+    assert removed
+    assert create_source == str(workspace.resolve())
 
 
 def _strict_cleanup_env() -> docker_env.DockerEnvironment:
@@ -752,6 +840,13 @@ def test_strict_init_failure_triggers_verified_teardown(monkeypatch, tmp_path, c
             return SimpleNamespace(stdout=json.dumps([payload]), stderr="", returncode=0)
         if args[1] in {"start", "stop"}:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if args[1] == "exec":
+            identity = docker_env._strict_source_root_identity(workspace)
+            return SimpleNamespace(
+                stdout=f"{identity[0]}:{identity[1]}\n",
+                stderr="",
+                returncode=0,
+            )
         if args[1:3] == ["rm", "-f"]:
             if cleanup_failure:
                 return SimpleNamespace(stdout="", stderr="remove failed", returncode=1)
@@ -797,6 +892,7 @@ def test_strict_revalidates_mounts_before_every_exec(monkeypatch):
     env._verify_strict_control_volume = lambda: events.append("control-volume")
     env._verify_strict_control_volume_contents = lambda image=None: events.append("control-content")
     env._verify_strict_container = lambda **kwargs: events.append("inspect")
+    env._verify_strict_bound_mount_identities = lambda: events.append("bound-inodes")
     monkeypatch.setattr(
         docker_env,
         "_popen_bash",
@@ -806,8 +902,18 @@ def test_strict_revalidates_mounts_before_every_exec(monkeypatch):
     assert env._run_bash("true") is sentinel
     assert env._run_bash("true") is sentinel
     assert events == [
-        "revalidate", "control-volume", "control-content", "inspect", "exec",
-        "revalidate", "control-volume", "control-content", "inspect", "exec",
+        "revalidate",
+        "control-volume",
+        "control-content",
+        "inspect",
+        "bound-inodes",
+        "exec",
+        "revalidate",
+        "control-volume",
+        "control-content",
+        "inspect",
+        "bound-inodes",
+        "exec",
     ]
 
 
