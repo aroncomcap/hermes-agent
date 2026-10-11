@@ -57,10 +57,6 @@ def _ensure_slack_mock():
     ]:
         sys.modules.setdefault(name, mod)
 
-    # aiohttp is imported alongside slack-bolt; mock it if missing
-    sys.modules.setdefault("aiohttp", MagicMock())
-
-
 _ensure_slack_mock()
 
 # Patch SLACK_AVAILABLE before importing the adapter
@@ -369,7 +365,9 @@ class TestSlackSocketWatchdog:
         instances: list = []
 
         class FakeHandler:
-            def __init__(self, app, app_token, proxy=None):
+            def __init__(
+                self, app, app_token, *, web_client=None, session=None, proxy=None
+            ):
                 self.app = app
                 self.app_token = app_token
                 self.proxy = proxy
@@ -712,8 +710,9 @@ class TestSlackProxyBehavior:
         created_clients = []
 
         class FakeWebClient:
-            def __init__(self, token):
+            def __init__(self, token, session=None):
                 self.token = token
+                self.session = session
                 self.proxy = "constructor-default"
                 suffix = token.split("-")[-1]
                 self.auth_test = AsyncMock(
@@ -727,9 +726,9 @@ class TestSlackProxyBehavior:
                 created_clients.append(self)
 
         class FakeApp:
-            def __init__(self, token):
+            def __init__(self, token=None, client=None):
                 self.token = token
-                self.client = FakeWebClient(token)
+                self.client = client or FakeWebClient(token)
                 self.registered_events = []
                 self.registered_commands = []
                 self.registered_actions = []
@@ -760,11 +759,13 @@ class TestSlackProxyBehavior:
                 return decorator
 
         class FakeSocketModeHandler:
-            def __init__(self, app, app_token, proxy=None):
+            def __init__(
+                self, app, app_token, *, web_client=None, session=None, proxy=None
+            ):
                 self.app = app
                 self.app_token = app_token
                 self.proxy = proxy
-                self.client = MagicMock(proxy="constructor-default")
+                self.client = self
 
             async def start_async(self):
                 return None
@@ -806,8 +807,9 @@ class TestSlackProxyBehavior:
         created_clients = []
 
         class FakeWebClient:
-            def __init__(self, token):
+            def __init__(self, token, session=None):
                 self.token = token
+                self.session = session
                 self.proxy = "constructor-default"
                 suffix = token.split("-")[-1]
                 self.auth_test = AsyncMock(
@@ -821,9 +823,9 @@ class TestSlackProxyBehavior:
                 created_clients.append(self)
 
         class FakeApp:
-            def __init__(self, token):
+            def __init__(self, token=None, client=None):
                 self.token = token
-                self.client = FakeWebClient(token)
+                self.client = client or FakeWebClient(token)
                 self.registered_events = []
                 self.registered_commands = []
                 self.registered_actions = []
@@ -854,11 +856,13 @@ class TestSlackProxyBehavior:
                 return decorator
 
         class FakeSocketModeHandler:
-            def __init__(self, app, app_token, proxy=None):
+            def __init__(
+                self, app, app_token, *, web_client=None, session=None, proxy=None
+            ):
                 self.app = app
                 self.app_token = app_token
                 self.proxy = proxy
-                self.client = MagicMock(proxy="constructor-default")
+                self.client = self
 
             async def start_async(self):
                 return None

@@ -157,6 +157,8 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    "pre_external_request",
+    "post_external_request",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -1924,6 +1926,16 @@ class PluginManager:
                 )
         return results
 
+    def invoke_hook_strict(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke a security hook without swallowing callback failures."""
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[Any] = []
+        for callback in self._hooks.get(hook_name, []):
+            result = callback(**kwargs)
+            if result is not None:
+                results.append(result)
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2050,6 +2062,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_hook_strict(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke a fail-closed security lifecycle hook."""
+    return get_plugin_manager().invoke_hook_strict(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

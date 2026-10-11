@@ -78,7 +78,7 @@ class TestResolveProviderClientMainAlias:
         _write_config(tmp_path, {
             "model": {"default": "my-model", "provider": "beans"},
             "custom_providers": [
-                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
+                {"name": "beans", "base_url": "https://beans.local/v1", "api_key": "k"},
             ],
         })
         from agent.auxiliary_client import resolve_provider_client
@@ -91,7 +91,7 @@ class TestResolveProviderClientMainAlias:
         _write_config(tmp_path, {
             "model": {"default": "my-model", "provider": "custom:beans"},
             "custom_providers": [
-                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
+                {"name": "beans", "base_url": "https://beans.local/v1", "api_key": "k"},
             ],
         })
         from agent.auxiliary_client import resolve_provider_client
@@ -127,7 +127,7 @@ class TestResolveProviderClientNamedCustom:
         _write_config(tmp_path, {
             "model": {"default": "test-model"},
             "custom_providers": [
-                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
+                {"name": "beans", "base_url": "https://beans.local/v1", "api_key": "k"},
             ],
         })
         from agent.auxiliary_client import resolve_provider_client
@@ -140,7 +140,7 @@ class TestResolveProviderClientNamedCustom:
         _write_config(tmp_path, {
             "model": {"default": "main-model"},
             "custom_providers": [
-                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
+                {"name": "beans", "base_url": "https://beans.local/v1", "api_key": "k"},
             ],
         })
         from agent.auxiliary_client import resolve_provider_client
@@ -165,7 +165,7 @@ class TestResolveProviderClientNamedCustom:
         _write_config(tmp_path, {
             "model": {"default": "test"},
             "custom_providers": [
-                {"name": "beans", "base_url": "http://beans.local/v1"},
+                {"name": "beans", "base_url": "https://beans.local/v1"},
             ],
         })
         from agent.auxiliary_client import resolve_provider_client

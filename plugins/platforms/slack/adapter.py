@@ -56,9 +56,20 @@ from gateway.platforms.base import (
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks
+    from .owned_socket_mode import (
+        OwnedSocketModeHandler,
+        create_guarded_slack_session,
+    )
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks  # type: ignore
+    from owned_socket_mode import (  # type: ignore
+        OwnedSocketModeHandler,
+        create_guarded_slack_session,
+    )
 
+# Keep the established adapter injection seam while ensuring the production
+# implementation is always the Hermes-owned transport.
+AsyncSocketModeHandler = OwnedSocketModeHandler
 
 logger = logging.getLogger(__name__)
 
@@ -95,13 +106,12 @@ def check_slack_requirements() -> bool:
 
     def _import():
         from slack_bolt.async_app import AsyncApp
-        from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
         from slack_sdk.web.async_client import AsyncWebClient
         import aiohttp
 
         return {
             "AsyncApp": AsyncApp,
-            "AsyncSocketModeHandler": AsyncSocketModeHandler,
+            "AsyncSocketModeHandler": OwnedSocketModeHandler,
             "AsyncWebClient": AsyncWebClient,
             "aiohttp": aiohttp,
             "SLACK_AVAILABLE": True,
@@ -486,16 +496,22 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        self._slack_http_session: Optional[Any] = None
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
         if not self._app or not self._app_token:
             raise RuntimeError("Socket Mode requires an initialized app and app token")
 
+        if self._slack_http_session is None:
+            raise RuntimeError("Slack guarded HTTP session is not initialized")
         self._handler = AsyncSocketModeHandler(
-            self._app, self._app_token, proxy=self._proxy_url
+            self._app,
+            self._app_token,
+            web_client=self._app.client,
+            session=self._slack_http_session,
+            proxy=self._proxy_url,
         )
-        _apply_slack_proxy(self._handler.client, self._proxy_url)
 
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
@@ -1036,6 +1052,9 @@ class SlackAdapter(BasePlatformAdapter):
             # receive every Slack event and dispatch it twice, producing double
             # responses — the same bug that affected DiscordAdapter (#18187).
             await self._stop_socket_mode_handler()
+            if self._slack_http_session is not None:
+                await self._slack_http_session.close()
+                self._slack_http_session = None
             self._app = None
             self._app_token = app_token
             self._proxy_url = proxy_url
@@ -1050,12 +1069,21 @@ class SlackAdapter(BasePlatformAdapter):
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
-            self._app = AsyncApp(token=primary_token)
-            _apply_slack_proxy(self._app.client, proxy_url)
+            self._slack_http_session = create_guarded_slack_session()
+            primary_client = AsyncWebClient(
+                token=primary_token,
+                session=self._slack_http_session,
+            )
+            _apply_slack_proxy(primary_client, proxy_url)
+            self._app = AsyncApp(client=primary_client)
 
             # Register each bot token and map team_id → client
             for token in bot_tokens:
-                client = AsyncWebClient(token=token)
+                client = (
+                    primary_client
+                    if token == primary_token
+                    else AsyncWebClient(token=token, session=self._slack_http_session)
+                )
                 _apply_slack_proxy(client, proxy_url)
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
@@ -1334,6 +1362,9 @@ class SlackAdapter(BasePlatformAdapter):
                 )
 
         await self._stop_socket_mode_handler()
+        if self._slack_http_session is not None:
+            await self._slack_http_session.close()
+            self._slack_http_session = None
         self._app = None
         self._app_token = None
         self._proxy_url = None
