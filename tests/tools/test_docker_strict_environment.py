@@ -23,7 +23,8 @@ def _workspace(tmp_path: Path) -> Path:
 @pytest.fixture
 def short_socket_tmp_path():
     """Keep AF_UNIX fixture paths below macOS's 104-byte sun_path limit."""
-    with tempfile.TemporaryDirectory(prefix="hermes-sock-") as path:
+    short_root = "/tmp" if os.name != "nt" else None
+    with tempfile.TemporaryDirectory(prefix="hermes-sock-", dir=short_root) as path:
         yield Path(path)
 
 
