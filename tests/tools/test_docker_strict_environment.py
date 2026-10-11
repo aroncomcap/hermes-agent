@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import stat
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,13 @@ def _workspace(tmp_path: Path) -> Path:
     workspace = tmp_path / "workspace"
     (workspace / ".git").mkdir(parents=True)
     return workspace
+
+
+@pytest.fixture
+def short_socket_tmp_path():
+    """Keep AF_UNIX fixture paths below macOS's 104-byte sun_path limit."""
+    with tempfile.TemporaryDirectory(prefix="hermes-sock-") as path:
+        yield Path(path)
 
 
 def test_strict_mount_allowlist_is_canonical_and_closed(tmp_path):
@@ -117,9 +125,11 @@ def test_strict_workspace_allows_internal_symlinks_without_following(tmp_path):
     assert mounts[0]["source"] == str(workspace.resolve())
 
 
-def test_strict_mount_allowlist_rejects_preexisting_socket_and_fifo(tmp_path):
+def test_strict_mount_allowlist_rejects_preexisting_socket_and_fifo(
+    short_socket_tmp_path,
+):
     for node_type in ("socket", "fifo"):
-        workspace = _workspace(tmp_path / node_type)
+        workspace = _workspace(short_socket_tmp_path / node_type)
         node = workspace / node_type
         if node_type == "socket":
             sock = socket.socket(socket.AF_UNIX)
@@ -812,8 +822,11 @@ def test_strict_revalidates_mounts_before_every_exec(monkeypatch):
 
 
 @pytest.mark.parametrize("node_type", ["symlink", "fifo", "socket"])
-def test_strict_mount_runtime_artifact_is_inert_on_revalidation(tmp_path, node_type):
-    workspace = _workspace(tmp_path)
+def test_strict_mount_runtime_artifact_is_inert_on_revalidation(
+    short_socket_tmp_path,
+    node_type,
+):
+    workspace = _workspace(short_socket_tmp_path)
     mounts = docker_env._normalize_strict_mounts([{
         "source": str(workspace), "target": "/workspace", "mode": "ro",
     }])
@@ -828,7 +841,7 @@ def test_strict_mount_runtime_artifact_is_inert_on_revalidation(tmp_path, node_t
     node = workspace / f"late-{node_type}"
     sock = None
     if node_type == "symlink":
-        node.symlink_to(tmp_path / "outside")
+        node.symlink_to(short_socket_tmp_path / "outside")
     elif node_type == "fifo":
         os.mkfifo(node)
     else:
