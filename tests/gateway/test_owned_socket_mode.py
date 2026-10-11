@@ -6,20 +6,21 @@ import sqlite3
 import sys
 from types import SimpleNamespace
 
-import aiohttp
-from aiohttp import web
 import pytest
-import pytest_asyncio
 
 try:
     importlib.metadata.version("slack_sdk")
 except importlib.metadata.PackageNotFoundError:
-    pass
-else:
-    for _name in tuple(sys.modules):
-        if _name == "slack_sdk" or _name.startswith("slack_sdk."):
-            if not getattr(sys.modules[_name], "__file__", None):
-                sys.modules.pop(_name, None)
+    pytest.skip("requires the optional hermes-agent[slack] extra", allow_module_level=True)
+
+import aiohttp
+from aiohttp import web
+import pytest_asyncio
+
+for _name in tuple(sys.modules):
+    if _name == "slack_sdk" or _name.startswith("slack_sdk."):
+        if not getattr(sys.modules[_name], "__file__", None):
+            sys.modules.pop(_name, None)
 
 from slack_sdk.http_retry.builtin_async_handlers import AsyncRateLimitErrorRetryHandler
 from slack_sdk.web.async_client import AsyncWebClient

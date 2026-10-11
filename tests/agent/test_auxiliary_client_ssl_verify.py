@@ -25,17 +25,26 @@ def clean_tls_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+def _inner_transport(client):
+    transport = client._transport
+    seen = set()
+    while hasattr(transport, "_transport") and id(transport) not in seen:
+        seen.add(id(transport))
+        transport = transport._transport
+    return transport
+
+
 def test_build_keepalive_http_client_forwards_verify_context(clean_tls_env):
     ctx = ssl.create_default_context(cafile=certifi.where())
     client = build_keepalive_http_client("https://ollama.example.com/v1", verify=ctx)
     assert isinstance(client, httpx.Client)
-    assert client._transport._pool._ssl_context is ctx
+    assert _inner_transport(client)._pool._ssl_context is ctx
 
 
 def test_build_keepalive_http_client_verify_false_disables_hostname_check(clean_tls_env):
     client = build_keepalive_http_client("https://ollama.example.com/v1", verify=False)
     assert isinstance(client, httpx.Client)
-    assert client._transport._pool._ssl_context.check_hostname is False
+    assert _inner_transport(client)._pool._ssl_context.check_hostname is False
 
 
 def test_build_keepalive_http_client_default_verify_true(clean_tls_env):

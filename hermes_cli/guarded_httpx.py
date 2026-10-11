@@ -37,7 +37,9 @@ def build_origin_classifier(
         if parsed.username or parsed.password or parsed.fragment or not host:
             raise ValueError("invalid guarded origin")
         if scheme != "https" and not (
-            allow_local_http and scheme == "http" and host in {"127.0.0.1", "localhost"}
+            allow_local_http
+            and scheme == "http"
+            and host in {"127.0.0.1", "::1", "localhost"}
         ):
             raise ValueError("guarded origins require HTTPS")
         port = parsed.port or (443 if scheme == "https" else 80)

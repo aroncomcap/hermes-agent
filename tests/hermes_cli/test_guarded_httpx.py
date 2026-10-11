@@ -78,6 +78,40 @@ def _states(path):
         ).fetchall()
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:11434/v1",
+        "http://[::1]:11434/v1",
+    ],
+)
+def test_origin_classifier_allows_exact_loopback_http(origin):
+    classifier = build_origin_classifier(
+        [origin], methods={"POST"}, operation="model_inference", allow_local_http=True
+    )
+
+    assert classifier("POST", httpx.URL(f"{origin}/chat")) == "model_inference"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://example.com/v1",
+        "http://192.168.1.10:11434/v1",
+        "http://localhost.evil.example/v1",
+    ],
+)
+def test_origin_classifier_rejects_non_loopback_http(origin):
+    with pytest.raises(ValueError, match="require HTTPS"):
+        build_origin_classifier(
+            [origin],
+            methods={"POST"},
+            operation="model_inference",
+            allow_local_http=True,
+        )
+
+
 def test_sync_wire_attempt_completes_once(tmp_path, local_server):
     journal = tmp_path / "requests.sqlite3"
     controller = ExternalRequestController(journal)

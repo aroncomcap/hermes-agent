@@ -124,7 +124,7 @@ class TestAuxClientHonorsUserDefaultHeaders:
                 "default_headers": {"User-Agent": "curl/8.7.1"},
             },
             "custom_providers": [
-                {"name": "my-gw", "base_url": "http://my-gw.local/v1", "api_key": "k"},
+                {"name": "my-gw", "base_url": "https://my-gw.local/v1", "api_key": "k"},
             ],
         })
         with patch("agent.auxiliary_client.OpenAI") as mock_openai:

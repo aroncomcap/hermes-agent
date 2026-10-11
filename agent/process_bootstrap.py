@@ -189,8 +189,13 @@ def build_keepalive_http_client(
         timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)
 
         client_cls = httpx.AsyncClient if async_mode else httpx.Client
+        # Preserve Hermes' supported local-model path without weakening remote
+        # egress policy: plain HTTP remains restricted to canonical loopback.
         classifier = build_origin_classifier(
-            [guarded_base_url], methods={"POST"}, operation="model_inference"
+            [guarded_base_url],
+            methods={"POST"},
+            operation="model_inference",
+            allow_local_http=True,
         )
         if async_mode:
             inner_transport = httpx.AsyncHTTPTransport(
