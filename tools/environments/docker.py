@@ -1434,6 +1434,7 @@ class DockerEnvironment(BaseEnvironment):
                         check=True,
                         stdin=subprocess.DEVNULL,
                     )
+                    self._verify_strict_bound_mount_identities()
                 except BaseException as lifecycle_exc:
                     cleanup_failed = False
                     try:
@@ -1766,6 +1767,54 @@ class DockerEnvironment(BaseEnvironment):
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
 
+    def _verify_strict_bound_mount_identities(self) -> None:
+        """Prove the daemon mounted the validated source inodes.
+
+        Docker resolves bind source pathnames in the daemon after client-side
+        validation.  The container starts only the trusted image's inert sleep
+        command, so we can fail closed on the mounted roots before any agent
+        command or caller-controlled workspace content is executed.
+        """
+        container_id = self._container_id
+        if not container_id or container_id != self._strict_created_container_id:
+            raise RuntimeError("strict Docker container identity changed before execution")
+        for mount in self._strict_mounts:
+            target = mount["target"]
+            expected = self._strict_mount_source_identities.get(target)
+            if expected is None:
+                raise RuntimeError(
+                    f"strict mount source identity is unavailable: {target}"
+                )
+            result = subprocess.run(
+                [
+                    self._docker_exe,
+                    "exec",
+                    container_id,
+                    "/usr/bin/stat",
+                    "-Lc",
+                    "%d:%i",
+                    "--",
+                    target,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            try:
+                device, inode = (
+                    int(part) for part in result.stdout.strip().split(":", 1)
+                )
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    f"strict Docker could not prove bound mount identity: {target}"
+                )
+            if result.returncode != 0 or (device, inode) != expected:
+                raise RuntimeError(
+                    f"strict Docker bound the wrong source inode: {target}"
+                )
+
     def _verify_strict_container(self, *, require_running: bool) -> None:
         """Fail closed unless the created container exactly matches strict policy."""
         container_id = self._container_id
@@ -1913,6 +1962,7 @@ class DockerEnvironment(BaseEnvironment):
             self._verify_strict_control_volume()
             self._verify_strict_control_volume_contents()
             self._verify_strict_container(require_running=True)
+            self._verify_strict_bound_mount_identities()
             self._strict_verified_pre_exec = True
         cmd = [self._docker_exe, "exec"]
         if stdin_data is not None:

@@ -36,7 +36,8 @@ The strict lifecycle is fail-closed:
    and an image without a privileged init entrypoint.
 3. Canonicalize strict mounts and reject identical sources, nested sources,
    symlinked sources, non-policy targets, writable `/runtime`, and hardlink
-   inode intersections between writable and read-only source trees.
+   inode intersections between writable and read-only source trees. Record the
+   validated device/inode identity for every bind root.
 4. Build and verify the immutable control archive, create a new local Docker
    volume with lane/manifest labels, populate it with `tar`, chmod it read-only,
    and read it back through a read-only mount to verify the manifest again.
@@ -48,9 +49,13 @@ The strict lifecycle is fail-closed:
 6. Inspect the stopped container before start and reject image, mount, resource,
    network, user, capability, label, state, or identity drift. Any failure tears
    down the container and control volume and proves their absence.
-7. Revalidate mount source identity, source-tree safety, cross-tree inode
-   isolation, control volume identity, and live container inspection before
-   every exec. This closes TOCTOU windows after the first successful command.
+7. Start only the trusted image's inert `sleep` command, then use the trusted
+   image's `/usr/bin/stat` to prove that every bind root's actual device/inode
+   matches the validated host source before any agent command or workspace
+   content executes. This catches a parent-directory exchange while the daemon
+   resolves the bind. Re-prove the mounted identities, original pathnames,
+   source-tree safety, cross-tree inode isolation, control volume identity, and
+   live container inspection before every exec.
 8. Cleanup is idempotent and verified: strict containers are stopped, removed,
    inspected for absence, and only then is the handle discarded; strict control
    volumes are removed and inspected for absence. Failed teardown raises and
@@ -102,6 +107,7 @@ bundle path is required for approval/production use.
 The test suite and rehearsal cover:
 
 - identical, nested, and symlinked source paths
+- adversarial parent-directory exchange while Docker resolves a bind source
 - hardlink aliases within the control source and across workspace/runtime trees
 - late TOCTOU changes after initial verification and before later execs
 - sockets, FIFOs, block devices, char devices, symlinks, and archive links
