@@ -10,17 +10,19 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
 )
+from tools.environments.strict_control_bundle import ControlBundle, load_control_bundle, verify_control_bundle_archive
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,224 @@ _DOCKER_SEARCH_PATHS = [
 
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_STRICT_MOUNT_TARGETS = {"/workspace", "/runtime"}
+
+
+_STRICT_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _validate_strict_source_tree(
+    source: Path,
+    *,
+    allow_runtime_artifacts: bool = False,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> None:
+    """Fail closed unless *source* contains only real directories and files."""
+    _strict_source_file_inodes(
+        source,
+        allow_runtime_artifacts=allow_runtime_artifacts,
+        expected_root_identity=expected_root_identity,
+    )
+
+
+def _strict_source_root_identity(source: Path) -> tuple[int, int]:
+    """Return the no-follow device/inode identity of one mount-source root."""
+    try:
+        info = os.stat(source, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(
+            f"strict mount source could not be safely inspected: {source}"
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"strict mount source must be a real directory: {source}")
+    return info.st_dev, info.st_ino
+
+
+def _strict_source_file_inodes(
+    source: Path,
+    *,
+    allow_runtime_artifacts: bool = False,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> set[tuple[int, int]]:
+    """Return file inodes without following entries that can be swapped."""
+    found: set[tuple[int, int]] = set()
+    try:
+        root_fd = os.open(
+            source, os.O_RDONLY | os.O_DIRECTORY | _STRICT_NOFOLLOW
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"strict mount source could not be safely inspected: {source}"
+        ) from exc
+    try:
+        root_info = os.fstat(root_fd)
+    except OSError as exc:
+        os.close(root_fd)
+        raise ValueError(
+            f"strict mount source could not be safely inspected: {source}"
+        ) from exc
+    if expected_root_identity is not None and (
+        root_info.st_dev,
+        root_info.st_ino,
+    ) != expected_root_identity:
+        os.close(root_fd)
+        raise ValueError(f"strict mount source changed before execution: {source}")
+    pending: list[tuple[int, Path]] = [(root_fd, source)]
+    try:
+        while pending:
+            directory_fd, directory = pending.pop()
+            try:
+                try:
+                    names = sorted(os.listdir(directory_fd))
+                except OSError as exc:
+                    raise ValueError(
+                        f"strict mount source could not be safely inspected: {directory}"
+                    ) from exc
+                for name in names:
+                    path = directory / name
+                    try:
+                        info = os.stat(
+                            name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                    except OSError as exc:
+                        raise ValueError(
+                            f"strict mount entry could not be safely inspected: {path}"
+                        ) from exc
+                    if stat.S_ISLNK(info.st_mode):
+                        continue
+                    if stat.S_ISFIFO(info.st_mode) or stat.S_ISSOCK(info.st_mode):
+                        if allow_runtime_artifacts:
+                            continue
+                        raise ValueError(
+                            "strict mount source contains pre-existing host IPC node: "
+                            f"{path}"
+                        )
+                    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                        raise ValueError(
+                            "strict mount source contains a device or unsupported special node: "
+                            f"{path}"
+                        )
+                    flags = os.O_RDONLY | os.O_NONBLOCK | _STRICT_NOFOLLOW
+                    if stat.S_ISDIR(info.st_mode):
+                        flags |= os.O_DIRECTORY
+                    try:
+                        child_fd = os.open(name, flags, dir_fd=directory_fd)
+                    except OSError as exc:
+                        raise ValueError(
+                            f"strict mount entry could not be opened safely: {path}"
+                        ) from exc
+                    try:
+                        opened = os.fstat(child_fd)
+                    except OSError as exc:
+                        os.close(child_fd)
+                        raise ValueError(
+                            f"strict mount entry could not be opened safely: {path}"
+                        ) from exc
+                    if (
+                        opened.st_dev,
+                        opened.st_ino,
+                        stat.S_IFMT(opened.st_mode),
+                    ) != (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)):
+                        os.close(child_fd)
+                        raise ValueError(
+                            f"strict mount entry changed while being inspected: {path}"
+                        )
+                    if stat.S_ISDIR(opened.st_mode):
+                        pending.append((child_fd, path))
+                    else:
+                        found.add((opened.st_dev, opened.st_ino))
+                        os.close(child_fd)
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        for directory_fd, _ in pending:
+            os.close(directory_fd)
+        raise
+    return found
+
+
+def _normalize_strict_mounts(mounts: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    """Validate and canonicalize the complete strict-mode bind allowlist."""
+    if not isinstance(mounts, list) or not mounts:
+        raise ValueError("docker_strict_mounts must be a non-empty list")
+
+    normalized: list[dict[str, str]] = []
+    seen_targets: set[str] = set()
+    for entry in mounts:
+        if not isinstance(entry, dict):
+            raise ValueError("each docker_strict_mounts entry must be a mapping")
+        if set(entry) != {"source", "target", "mode"}:
+            raise ValueError("strict mount entries require only source, target, and mode")
+        source_raw = entry.get("source")
+        target = entry.get("target")
+        mode = entry.get("mode")
+        if not all(isinstance(v, str) and v for v in (source_raw, target, mode)):
+            raise ValueError("strict mount source, target, and mode must be non-empty strings")
+        source_abs = Path(source_raw).expanduser().absolute()
+        source = source_abs.resolve(strict=True)
+        if source_abs != source:
+            raise ValueError(f"strict mount source may not contain symlinks: {source_raw}")
+        if not source.is_dir():
+            raise ValueError(f"strict mount source must be a directory: {source}")
+        _validate_strict_source_tree(source)
+        if target not in _STRICT_MOUNT_TARGETS or target in seen_targets:
+            raise ValueError(
+                f"strict mount target must be unique and one of {_STRICT_MOUNT_TARGETS}: {target}"
+            )
+        if mode not in {"ro", "rw"}:
+            raise ValueError("strict mount mode must be ro or rw")
+        if target == "/runtime" and mode != "ro":
+            raise ValueError("/runtime must be mounted read-only in strict mode")
+        if target == "/workspace" and not (source / ".git").is_dir():
+            raise ValueError(
+                "strict /workspace source must be a disposable clone with a .git directory"
+            )
+        seen_targets.add(target)
+        normalized.append({"source": str(source), "target": target, "mode": mode})
+
+    if "/workspace" not in seen_targets:
+        raise ValueError("strict mode requires exactly one /workspace mount")
+    _validate_strict_mount_isolation(normalized)
+    return sorted(normalized, key=lambda item: item["target"])
+
+
+def _validate_strict_mount_isolation(
+    mounts: list[dict[str, str]],
+    *,
+    allow_runtime_artifacts: bool = False,
+    expected_root_identities: dict[str, tuple[int, int]] | None = None,
+) -> None:
+    """Reject source aliases between writable and read-only strict mounts."""
+    writable = [Path(item["source"]) for item in mounts if item["mode"] == "rw"]
+    read_only = [Path(item["source"]) for item in mounts if item["mode"] == "ro"]
+    for writable_source in writable:
+        for read_only_source in read_only:
+            if (
+                writable_source == read_only_source
+                or writable_source.is_relative_to(read_only_source)
+                or read_only_source.is_relative_to(writable_source)
+            ):
+                raise ValueError(
+                    "strict writable and read-only mount sources may not overlap: "
+                    f"{writable_source} and {read_only_source}"
+                )
+            if _strict_source_file_inodes(
+                writable_source,
+                allow_runtime_artifacts=allow_runtime_artifacts,
+                expected_root_identity=(expected_root_identities or {}).get(
+                    str(writable_source)
+                ),
+            ) & _strict_source_file_inodes(
+                read_only_source,
+                allow_runtime_artifacts=allow_runtime_artifacts,
+                expected_root_identity=(expected_root_identities or {}).get(
+                    str(read_only_source)
+                ),
+            ):
+                raise ValueError(
+                    "strict writable and read-only mount sources may not share file inodes: "
+                    f"{writable_source} and {read_only_source}"
+                )
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -565,6 +785,26 @@ def _ensure_docker_available() -> None:
             )
 
 
+def _rootless_docker_available() -> bool:
+    """Return whether the active Docker daemon proves rootless operation."""
+    docker_exe = find_docker()
+    if not docker_exe:
+        return False
+    try:
+        result = subprocess.run(
+            [docker_exe, "info", "--format", "{{json .SecurityOptions}}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        options = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return False
+    return isinstance(options, list) and "name=rootless" in options
+
+
 class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution with resource limits and persistence.
 
@@ -596,12 +836,32 @@ class DockerEnvironment(BaseEnvironment):
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
+        strict_mode: bool = False,
+        strict_mounts: list[dict[str, str]] | None = None,
+        strict_control_source: str | None = None,
+        strict_control_lane: str | None = None,
+        strict_control_manifest_digest: str | None = None,
     ):
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes
+        self._strict_mode = strict_mode
+        self._strict_verified_pre_exec = False
+        self._strict_expected_image_id = ""
+        self._strict_expected_mounts: list[dict[str, Any]] = []
+        self._strict_expected_resources: dict[str, int] = {}
+        self._strict_expected_user = ""
+        self._strict_mounts: list[dict[str, str]] = []
+        self._strict_mount_source_identities: dict[str, tuple[int, int]] = {}
+        self._strict_created_container_id = ""
+        self._strict_control_bundle: ControlBundle | None = None
+        self._strict_control_volume = ""
+        self._strict_control_lane = ""
+        self._strict_expected_control_manifest_digest = ""
+        self._strict_helper_label = ""
+        self._propagate_init_session_errors = strict_mode
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
@@ -617,30 +877,122 @@ class DockerEnvironment(BaseEnvironment):
             logger.warning(f"docker_volumes config is not a list: {volumes!r}")
             volumes = []
 
+        normalized_strict_mounts: list[dict[str, str]] = []
+        if strict_mode:
+            conflicts = {
+                "persistent_filesystem": persistent_filesystem,
+                "persist_across_processes": persist_across_processes,
+                "docker_volumes": bool(volumes),
+                "docker_forward_env": bool(forward_env),
+                "docker_env": bool(env),
+                "docker_extra_args": bool(extra_args),
+                "auto_mount_cwd": auto_mount_cwd,
+            }
+            enabled = sorted(name for name, value in conflicts.items() if value)
+            if enabled:
+                raise ValueError("strict Docker mode forbids: " + ", ".join(enabled))
+            if network:
+                raise ValueError("strict Docker mode requires docker_network=false")
+            if cwd != "/workspace":
+                raise ValueError("strict Docker mode requires cwd=/workspace")
+            if not run_as_host_user:
+                raise ValueError(
+                    "strict Docker mode requires docker_run_as_host_user=true"
+                )
+            user_spec = _resolve_host_user_spec()
+            if not user_spec or not re.fullmatch(r"[0-9]+:[0-9]+", user_spec):
+                raise RuntimeError(
+                    "strict Docker mode requires an exact numeric host uid:gid"
+                )
+            uid, gid = (int(part) for part in user_spec.split(":", 1))
+            if uid == 0 or gid == 0:
+                raise RuntimeError(
+                    "strict Docker mode requires a non-root host uid:gid"
+                )
+            self._strict_expected_user = user_spec
+            if cpu <= 0 or memory <= 0:
+                raise RuntimeError(
+                    "strict Docker mode requires positive CPU and memory limits"
+                )
+            normalized_strict_mounts = _normalize_strict_mounts(strict_mounts)
+            self._strict_mounts = normalized_strict_mounts
+            self._strict_mount_source_identities = {
+                mount["target"]: _strict_source_root_identity(Path(mount["source"]))
+                for mount in normalized_strict_mounts
+            }
+            if strict_control_source is not None:
+                if strict_control_lane not in {"writer", "reviewer"}:
+                    raise ValueError("strict control lane must be writer or reviewer")
+                if any(mount["target"] == "/runtime" for mount in normalized_strict_mounts):
+                    raise ValueError("strict control bundle forbids caller-supplied /runtime bind")
+                workspace_mount = next(
+                    mount for mount in normalized_strict_mounts
+                    if mount["target"] == "/workspace"
+                )
+                required_mode = "rw" if strict_control_lane == "writer" else "ro"
+                if workspace_mount["mode"] != required_mode:
+                    raise ValueError(
+                        f"strict {strict_control_lane} lane requires {required_mode} workspace"
+                    )
+                self._strict_control_bundle = load_control_bundle(
+                    strict_control_source, workspace_mount["source"]
+                )
+                if not strict_control_manifest_digest:
+                    raise ValueError("strict control source requires a shared manifest digest")
+                if not re.fullmatch(r"[0-9a-f]{64}", strict_control_manifest_digest):
+                    raise ValueError("strict control manifest digest must be a sha256 hex digest")
+                if self._strict_control_bundle.manifest_digest != strict_control_manifest_digest:
+                    raise ValueError("strict control source manifest does not match shared digest")
+                self._strict_expected_control_manifest_digest = strict_control_manifest_digest
+                self._strict_control_lane = strict_control_lane
+                self._strict_helper_label = uuid.uuid4().hex
+                self._strict_control_volume = (
+                    f"hermes-strict-{strict_control_lane}-{uuid.uuid4().hex}"
+                )
+            elif strict_control_lane is not None:
+                raise ValueError("strict control lane requires strict control source")
+
         # Fail fast if Docker is not available.
         _ensure_docker_available()
+        if strict_mode and not _rootless_docker_available():
+            raise RuntimeError(
+                "strict Docker mode requires a Docker daemon that reports name=rootless"
+            )
 
         # Build resource limit args (gated by cgroup availability probe so
         # they degrade gracefully on hosts without controller delegation,
         # e.g. unprivileged LXCs). The probe runs once per process and is
         # cached host-wide.
-        resource_args = []
-        if cpu > 0 and _cgroup_limits_available(image):
-            resource_args.extend(["--cpus", str(cpu)])
-        if memory > 0 and _cgroup_limits_available(image):
-            resource_args.extend(["--memory", f"{memory}m"])
-        if _cgroup_limits_available(image):
-            resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
-        if disk > 0 and sys.platform != "darwin":
-            if self._storage_opt_supported():
-                resource_args.extend(["--storage-opt", f"size={disk}m"])
-            else:
-                logger.warning(
-                    "Docker storage driver does not support per-container disk limits "
-                    "(requires overlay2 on XFS with pquota). Container will run without disk quota."
-                )
-        if not network:
-            resource_args.append("--network=none")
+        if strict_mode:
+            self._strict_expected_resources = {
+                "NanoCpus": int(cpu * 1_000_000_000),
+                "Memory": memory * 1024 * 1024,
+                "PidsLimit": int(_DEFAULT_PIDS_LIMIT),
+            }
+            resource_args = [
+                "--cpus", str(cpu),
+                "--memory", f"{memory}m",
+                "--pids-limit", _DEFAULT_PIDS_LIMIT,
+                "--network=none",
+            ]
+        else:
+            resource_args = []
+            if cpu > 0 and _cgroup_limits_available(image):
+                resource_args.extend(["--cpus", str(cpu)])
+            if memory > 0 and _cgroup_limits_available(image):
+                resource_args.extend(["--memory", f"{memory}m"])
+            if _cgroup_limits_available(image):
+                resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
+            if disk > 0 and sys.platform != "darwin":
+                if self._storage_opt_supported():
+                    resource_args.extend(["--storage-opt", f"size={disk}m"])
+                else:
+                    logger.warning(
+                        "Docker storage driver does not support per-container disk limits "
+                        "(requires overlay2 on XFS with pquota). Container will run without disk quota."
+                    )
+            if not network:
+                resource_args.append("--network=none")
 
         # Persistent workspace via bind mounts from a configurable host directory
         # (TERMINAL_SANDBOX_DIR, default ~/.hermes/sandboxes/). Non-persistent
@@ -650,7 +1002,7 @@ class DockerEnvironment(BaseEnvironment):
         # User-configured volume mounts (from config.yaml docker_volumes)
         volume_args = []
         workspace_explicitly_mounted = False
-        for vol in (volumes or []):
+        for vol in ([] if strict_mode else (volumes or [])):
             if not isinstance(vol, str):
                 logger.warning(f"Docker volume entry is not a string: {vol!r}")
                 continue
@@ -677,7 +1029,36 @@ class DockerEnvironment(BaseEnvironment):
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
         writable_args = []
-        if self._persistent:
+        if strict_mode:
+            for mount in normalized_strict_mounts:
+                volume_args.extend([
+                    "--mount",
+                    "type=bind,src={source},dst={target},readonly={readonly},bind-recursive=disabled".format(
+                        source=mount["source"],
+                        target=mount["target"],
+                        readonly=str(mount["mode"] == "ro").lower(),
+                    ),
+                ])
+                self._strict_expected_mounts.append({
+                    "Type": "bind",
+                    "Source": mount["source"],
+                    "Destination": mount["target"],
+                    "RW": mount["mode"] == "rw",
+                })
+            if self._strict_control_bundle is not None:
+                volume_args.extend(["--mount", f"type=volume,src={self._strict_control_volume},dst=/runtime,readonly"])
+                self._strict_expected_mounts.append(
+                    {"Type": "volume", "Name": self._strict_control_volume, "Destination": "/runtime", "RW": False}
+                )
+            writable_args.extend([
+                "--read-only",
+                "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
+                "--tmpfs", "/var/tmp:rw,noexec,nosuid,nodev,size=256m",
+                "--tmpfs", "/home:rw,nosuid,nodev,size=64m",
+                "--tmpfs", "/root:rw,nosuid,nodev,size=64m",
+                "--tmpfs", "/workspace/.git:rw,noexec,nosuid,nodev,size=1m",
+            ])
+        elif self._persistent:
             sandbox = get_sandbox_dir() / "docker" / task_id
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
@@ -715,7 +1096,7 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            for mount_entry in ([] if strict_mode else get_credential_file_mounts()):
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
@@ -744,7 +1125,7 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in ([] if strict_mode else get_skills_directory_mount()):
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -766,7 +1147,7 @@ class DockerEnvironment(BaseEnvironment):
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
+            for cache_mount in ([] if strict_mode else get_cache_directory_mounts()):
                 src = Path(cache_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -798,7 +1179,11 @@ class DockerEnvironment(BaseEnvironment):
         # platforms without POSIX uid/gid (e.g. native Windows Docker).
         user_args: list[str] = []
         if run_as_host_user:
-            user_spec = _resolve_host_user_spec()
+            user_spec = (
+                self._strict_expected_user
+                if strict_mode
+                else _resolve_host_user_spec()
+            )
             if user_spec is not None:
                 user_args = ["--user", user_spec]
                 logger.info("Docker: running container as host user %s", user_spec)
@@ -822,6 +1207,10 @@ class DockerEnvironment(BaseEnvironment):
         # "Permission denied". Detected once here; defaults are kept on any
         # inspection failure. See issue #34628.
         image_uses_s6_init = _image_uses_init_entrypoint(self._docker_exe, image)
+        if strict_mode and image_uses_s6_init:
+            raise ValueError(
+                "strict Docker mode requires an image without a privileged init entrypoint"
+            )
         if image_uses_s6_init:
             logger.info(
                 "Docker: image %s uses /init (s6-overlay) as entrypoint — "
@@ -832,12 +1221,17 @@ class DockerEnvironment(BaseEnvironment):
             run_as_host_user and bool(user_args),
             run_exec=image_uses_s6_init,
         )
+        if strict_mode:
+            security_args = [
+                "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges",
+            ]
 
         logger.info(f"Docker volume_args: {volume_args}")
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
         # Appended last so they can override defaults if needed.
         validated_extra = []
-        for arg in (extra_args or []):
+        for arg in ([] if strict_mode else (extra_args or [])):
             if not isinstance(arg, str):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
@@ -870,6 +1264,11 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
         ]
+        if strict_mode:
+            label_args.extend([
+                "--label", "hermes-strict=1",
+                "--label", f"hermes-strict-run={uuid.uuid4().hex}",
+            ])
         # Save args for container recreation on "No such container" recovery.
         self._image = image
         self._container_name = container_name
@@ -895,7 +1294,7 @@ class DockerEnvironment(BaseEnvironment):
         # false`` (or run ``docker rm -f`` against the labeled container) to
         # force a clean start.
         reused = False
-        if persist_across_processes:
+        if persist_across_processes and not strict_mode:
             existing = self._find_reusable_container(task_label, profile_name)
             if existing is not None:
                 container_id, state = existing
@@ -949,7 +1348,7 @@ class DockerEnvironment(BaseEnvironment):
                             check=True,
                             stdin=subprocess.DEVNULL,
                         )
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, OSError) as e:
                         logger.warning(
                             "Failed to start existing container %s (state=%s): "
                             "%s — falling back to a fresh container.",
@@ -968,8 +1367,10 @@ class DockerEnvironment(BaseEnvironment):
             # images already provide their own /init PID 1, so adding --init
             # there creates two competing inits and breaks startup (#34628).
             init_args = [] if image_uses_s6_init else ["--init"]
+            lifecycle_command = "create" if strict_mode else "run"
+            lifecycle_args = [] if strict_mode else ["-d"]
             run_cmd = [
-                self._docker_exe, "run", "-d",
+                self._docker_exe, lifecycle_command, *lifecycle_args,
                 *init_args,
                 "--name", container_name,
                 *label_args,
@@ -980,6 +1381,9 @@ class DockerEnvironment(BaseEnvironment):
             ]
             logger.debug(f"Starting container: {' '.join(run_cmd)}")
             try:
+                if strict_mode:
+                    self._create_strict_control_volume(image)
+                    self._revalidate_strict_mounts()
                 result = subprocess.run(
                     run_cmd,
                     capture_output=True,
@@ -988,7 +1392,7 @@ class DockerEnvironment(BaseEnvironment):
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            except BaseException as e:
                 # Docker may create the container object before `docker run`
                 # fails to start it (e.g. exit code 125 when the daemon isn't
                 # ready, or a timeout mid-pull). That orphan is left in
@@ -1000,13 +1404,56 @@ class DockerEnvironment(BaseEnvironment):
                     "docker run failed for %s, cleaning up orphaned container: %s",
                     container_name, e,
                 )
-                subprocess.run(
-                    [self._docker_exe, "rm", "-f", container_name],
-                    capture_output=True, timeout=10,
-                    stdin=subprocess.DEVNULL,
-                )
+                try:
+                    self._teardown_strict_container(container_name)
+                except BaseException as cleanup_error:
+                    e.add_note(
+                        f"strict Docker create cleanup also failed: {cleanup_error}"
+                    )
+                if strict_mode and self._strict_control_volume:
+                    try:
+                        self._teardown_strict_control_volume()
+                    except BaseException as cleanup_error:
+                        e.add_note(
+                            f"strict Docker create cleanup also failed: {cleanup_error}"
+                        )
                 raise
             self._container_id = result.stdout.strip()
+            if strict_mode:
+                try:
+                    self._strict_created_container_id = self._container_id
+                    self._strict_expected_image_id = self._inspect_image_id(image)
+                    self._verify_strict_container(require_running=False)
+                    self._verify_strict_control_volume()
+                    self._revalidate_strict_mounts()
+                    subprocess.run(
+                        [self._docker_exe, "start", self._container_id],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=True,
+                        stdin=subprocess.DEVNULL,
+                    )
+                except BaseException as lifecycle_exc:
+                    cleanup_failed = False
+                    try:
+                        self._teardown_strict_container(self._container_id)
+                    except BaseException as cleanup_exc:
+                        lifecycle_exc.add_note(
+                            f"strict Docker lifecycle cleanup also failed: {cleanup_exc}"
+                        )
+                        cleanup_failed = True
+                    if self._strict_control_volume:
+                        try:
+                            self._teardown_strict_control_volume()
+                        except BaseException as cleanup_exc:
+                            lifecycle_exc.add_note(
+                                f"strict Docker lifecycle cleanup also failed: {cleanup_exc}"
+                            )
+                            cleanup_failed = True
+                    if not cleanup_failed:
+                        self._container_id = None
+                    raise
             logger.info(f"Started container {container_name} ({self._container_id[:12]})")
 
         # Build the init-time env forwarding args (used only by init_session
@@ -1015,7 +1462,407 @@ class DockerEnvironment(BaseEnvironment):
         self._init_env_args = self._build_init_env_args()
 
         # Initialize session snapshot inside the container
-        self.init_session()
+        try:
+            self.init_session()
+        except BaseException as init_exc:
+            if strict_mode and self._container_id:
+                cleanup_failed = False
+                try:
+                    self._teardown_strict_container(self._container_id)
+                except BaseException as cleanup_exc:
+                    init_exc.add_note(
+                        f"strict Docker initialization cleanup also failed: {cleanup_exc}"
+                    )
+                    cleanup_failed = True
+                if self._strict_control_volume:
+                    try:
+                        self._teardown_strict_control_volume()
+                    except BaseException as cleanup_exc:
+                        init_exc.add_note(
+                            f"strict Docker initialization cleanup also failed: {cleanup_exc}"
+                        )
+                        cleanup_failed = True
+                if not cleanup_failed:
+                    self._container_id = None
+            raise
+
+    def _inspect_strict_control_volume(self) -> dict[str, Any]:
+        result = subprocess.run(
+            [self._docker_exe, "volume", "inspect", self._strict_control_volume],
+            capture_output=True, text=True, timeout=30, check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            inspected = json.loads(result.stdout)
+            if not isinstance(inspected, list) or len(inspected) != 1:
+                raise ValueError
+            return inspected[0]
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("strict control volume inspection was not trustworthy") from exc
+
+    def _verify_strict_control_volume(self) -> None:
+        if not getattr(self, "_strict_control_volume", ""):
+            return
+        info = self._inspect_strict_control_volume()
+        labels = info.get("Labels") or {}
+        expected_labels = {
+            "hermes-strict-control": "1",
+            "hermes-strict-lane": self._strict_control_lane,
+            "hermes-strict-manifest": self._strict_expected_control_manifest_digest,
+        }
+        if (
+            info.get("Name") != self._strict_control_volume
+            or info.get("Driver") != "local"
+            or info.get("Scope") != "local"
+            or (info.get("Options") or {}) != {}
+            or labels != expected_labels
+        ):
+            raise RuntimeError("strict control volume identity or driver policy changed")
+
+    def _strict_helper_resource_args(self) -> list[str]:
+        resources = getattr(self, "_strict_expected_resources", {}) or {}
+        args: list[str] = []
+        nano_cpus = int(resources.get("NanoCpus") or 0)
+        if nano_cpus > 0:
+            args.extend(["--cpus", str(nano_cpus / 1_000_000_000).rstrip("0").rstrip(".")])
+        memory = int(resources.get("Memory") or 0)
+        if memory > 0:
+            args.extend(["--memory", f"{memory // (1024 * 1024)}m"])
+        pids = int(resources.get("PidsLimit") or 0)
+        if pids > 0:
+            args.extend(["--pids-limit", str(pids)])
+        return args
+
+    def _strict_helper_base_args(self, name: str, user_spec: str) -> list[str]:
+        if not self._strict_expected_control_manifest_digest:
+            raise RuntimeError("strict control helper has no shared manifest digest")
+        return [
+            self._docker_exe, "run", "--name", name,
+            "-i",
+            "--label", "hermes-strict-control-helper=1",
+            "--label", f"hermes-strict-helper={self._strict_helper_label}",
+            "--label", f"hermes-strict-lane={self._strict_control_lane}",
+            "--label", f"hermes-strict-manifest={self._strict_expected_control_manifest_digest}",
+            "--network=none",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+            "--tmpfs", "/var/tmp:rw,noexec,nosuid,nodev,size=16m",
+            *self._strict_helper_resource_args(),
+            "--user", user_spec,
+            "--entrypoint", "tar",
+        ]
+
+    def _cleanup_strict_helper_container(self, name: str) -> None:
+        try:
+            self._teardown_strict_container(name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"strict control helper residue cleanup failed for {name}: {exc}"
+            ) from exc
+
+    def _run_strict_control_helper(
+        self,
+        image: str,
+        mount_spec: str,
+        tar_args: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        user_spec: str,
+    ) -> subprocess.CompletedProcess:
+        name = f"hermes-strict-helper-{uuid.uuid4().hex}"
+        cmd = [*self._strict_helper_base_args(name, user_spec), "--mount", mount_spec, image, *tar_args]
+        try:
+            result = subprocess.run(
+                cmd,
+                input=input_bytes,
+                capture_output=True,
+                timeout=120,
+                check=True,
+                stdin=subprocess.DEVNULL if input_bytes is None else None,
+            )
+        except BaseException as primary_error:
+            try:
+                self._cleanup_strict_helper_container(name)
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"strict control helper cleanup also failed: {cleanup_error}"
+                )
+            raise
+        else:
+            self._cleanup_strict_helper_container(name)
+            return result
+
+    def _verify_strict_control_volume_contents(self, image: str | None = None) -> None:
+        """Re-hash the live read-only control volume against the trusted manifest."""
+        if not getattr(self, "_strict_control_volume", ""):
+            return
+        if self._strict_control_bundle is None:
+            raise RuntimeError("strict control volume has no trusted bundle")
+        readback = self._run_strict_control_helper(
+            image or self._image,
+            f"type=volume,src={self._strict_control_volume},dst=/runtime,readonly",
+            ["-C", "/runtime", "-cf", "-", "."],
+            user_spec=self._strict_expected_user,
+        )
+        verify_control_bundle_archive(
+            readback.stdout, self._strict_expected_control_manifest_digest
+        )
+
+    def _create_strict_control_volume(self, image: str) -> None:
+        if self._strict_control_bundle is None:
+            return
+        probe = subprocess.run(
+            [self._docker_exe, "volume", "inspect", self._strict_control_volume],
+            capture_output=True, text=True, timeout=30, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0:
+            raise RuntimeError("strict control volume reuse is forbidden")
+        if "no such volume" not in (probe.stderr or "").lower():
+            raise RuntimeError("strict control volume absence could not be proven")
+        labels = [
+            "--label", "hermes-strict-control=1",
+            "--label", f"hermes-strict-lane={self._strict_control_lane}",
+            "--label", f"hermes-strict-manifest={self._strict_expected_control_manifest_digest}",
+        ]
+        subprocess.run(
+            [self._docker_exe, "volume", "create", *labels, self._strict_control_volume],
+            capture_output=True, text=True, timeout=30, check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            self._verify_strict_control_volume()
+            self._run_strict_control_helper(
+                image,
+                f"type=volume,src={self._strict_control_volume},dst=/runtime",
+                ["-xf", "-", "-C", "/runtime"],
+                # Bootstrap privilege is limited to populating the fresh private
+                # control volume; no workspace or user content is mounted.
+                user_spec="0:0",
+                input_bytes=self._strict_control_bundle.archive,
+            )
+            self._verify_strict_control_volume()
+            self._verify_strict_control_volume_contents(image)
+        except BaseException as primary_error:
+            try:
+                self._teardown_strict_control_volume()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"strict control volume cleanup also failed: {cleanup_error}"
+                )
+            raise
+
+    def _teardown_strict_control_volume(self) -> None:
+        name = self._strict_control_volume
+        if not name:
+            return
+        result = None
+        remove_error = None
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "volume", "rm", name],
+                capture_output=True, text=True, timeout=30, check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            remove_error = exc
+        probe = None
+        inspect_error = None
+        try:
+            probe = subprocess.run(
+                [self._docker_exe, "volume", "inspect", name],
+                capture_output=True, text=True, timeout=30, check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            inspect_error = exc
+        if (
+            probe is not None
+            and probe.returncode != 0
+            and "no such volume" in (probe.stderr or "").lower()
+        ):
+            self._strict_control_volume = ""
+            return
+        if remove_error is not None:
+            suffix = (
+                f"; absence verification also failed: {inspect_error}"
+                if inspect_error is not None
+                else ""
+            )
+            raise RuntimeError(
+                f"strict control volume removal failed: {remove_error}{suffix}"
+            ) from remove_error
+        if result is not None and result.returncode != 0:
+            suffix = (
+                f"; absence verification also failed: {inspect_error}"
+                if inspect_error is not None
+                else ""
+            )
+            raise RuntimeError(f"strict control volume removal failed{suffix}")
+        if inspect_error is not None:
+            raise RuntimeError(
+                f"strict control volume absence could not be verified: {inspect_error}"
+            ) from inspect_error
+        raise RuntimeError("strict control volume absence could not be verified")
+
+    def _inspect_image_id(self, image: str) -> str:
+        """Resolve the immutable local image identity used by strict mode."""
+        result = subprocess.run(
+            [self._docker_exe, "image", "inspect", image, "--format", "{{.Id}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        image_id = result.stdout.strip()
+        if not image_id.startswith("sha256:"):
+            raise RuntimeError("strict Docker mode could not prove the image digest")
+        return image_id
+
+    def _revalidate_strict_mounts(self) -> None:
+        """Re-prove canonical strict mount sources at every lifecycle boundary."""
+        revalidated: list[dict[str, str]] = []
+        for mount in self._strict_mounts:
+            source = Path(mount["source"])
+            expected_identity = self._strict_mount_source_identities.get(mount["target"])
+            if expected_identity is None:
+                raise RuntimeError(
+                    f"strict mount source identity is unavailable: {source}"
+                )
+            try:
+                actual_identity = _strict_source_root_identity(source)
+                resolved = source.resolve(strict=True)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"strict mount source changed before execution: {source}"
+                ) from exc
+            if actual_identity != expected_identity or resolved != source:
+                raise RuntimeError(
+                    f"strict mount source changed before execution: {source}"
+                )
+            try:
+                _validate_strict_source_tree(
+                    source,
+                    allow_runtime_artifacts=True,
+                    expected_root_identity=expected_identity,
+                )
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+            revalidated.append({**mount, "source": str(resolved)})
+        try:
+            _validate_strict_mount_isolation(
+                revalidated,
+                allow_runtime_artifacts=True,
+                expected_root_identities={
+                    mount["source"]: self._strict_mount_source_identities[
+                        mount["target"]
+                    ]
+                    for mount in revalidated
+                },
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def _verify_strict_container(self, *, require_running: bool) -> None:
+        """Fail closed unless the created container exactly matches strict policy."""
+        container_id = self._container_id
+        if not container_id or container_id != self._strict_created_container_id:
+            raise RuntimeError("strict Docker container identity changed before execution")
+
+        result = subprocess.run(
+            [self._docker_exe, "inspect", container_id],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            inspected = json.loads(result.stdout)
+            if not isinstance(inspected, list) or len(inspected) != 1:
+                raise ValueError("inspect did not return one container")
+            info = inspected[0]
+        except (ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError("strict Docker inspection was not trustworthy") from exc
+
+        failures: list[str] = []
+        if info.get("Id") != container_id:
+            failures.append("container identity")
+        if info.get("Image") != self._strict_expected_image_id:
+            failures.append("image digest")
+
+        actual_mounts: list[dict[str, Any]] = []
+        expected_mounts = [
+            ({"Type": "bind", **mount} if "Type" not in mount else mount)
+            for mount in self._strict_expected_mounts
+        ]
+        for mount in info.get("Mounts") or []:
+            mount_type = mount.get("Type")
+            actual = {
+                "Type": mount_type,
+                "Destination": mount.get("Destination"),
+                "RW": bool(mount.get("RW")),
+            }
+            if mount_type == "bind":
+                actual["Source"] = str(Path(mount.get("Source", "")).resolve())
+            elif mount_type == "volume":
+                actual["Name"] = mount.get("Name")
+            else:
+                failures.append("unsupported mount type")
+                continue
+            actual_mounts.append(actual)
+        mount_key = lambda item: str(item.get("Destination"))
+        if sorted(actual_mounts, key=mount_key) != sorted(
+            expected_mounts, key=mount_key
+        ):
+            failures.append("mount allowlist")
+
+        host_config = info.get("HostConfig") or {}
+        config = info.get("Config") or {}
+        state = info.get("State") or {}
+        if host_config.get("NetworkMode") != "none":
+            failures.append("network mode")
+        if host_config.get("Privileged") is not False:
+            failures.append("privileged mode")
+        if host_config.get("ReadonlyRootfs") is not True:
+            failures.append("read-only rootfs")
+        if host_config.get("CapAdd") not in (None, []):
+            failures.append("added capabilities")
+        if "ALL" not in (host_config.get("CapDrop") or []):
+            failures.append("dropped capabilities")
+        if "no-new-privileges" not in (host_config.get("SecurityOpt") or []):
+            failures.append("no-new-privileges")
+        if host_config.get("PidMode") not in (None, ""):
+            failures.append("host PID namespace")
+        if any(
+            int(host_config.get(key) or 0) != expected
+            for key, expected in self._strict_expected_resources.items()
+        ):
+            failures.append("resource limits")
+        tmpfs = host_config.get("Tmpfs") or {}
+        for target in ("/tmp", "/var/tmp", "/home", "/root", "/workspace/.git"):
+            if target not in tmpfs:
+                failures.append(f"tmpfs {target}")
+
+        user = str(config.get("User") or "")
+        if user != self._strict_expected_user:
+            failures.append("user identity")
+        labels = config.get("Labels") or {}
+        if labels.get("hermes-strict") != "1" or not labels.get("hermes-strict-run"):
+            failures.append("strict identity labels")
+        if require_running:
+            if state.get("Running") is not True or state.get("Status") != "running":
+                failures.append("running state")
+        elif state.get("Running") is not False or state.get("Status") != "created":
+            failures.append("created state")
+
+        if failures:
+            raise RuntimeError(
+                "strict Docker pre-exec verification failed: " + ", ".join(failures)
+            )
 
     def _build_init_env_args(self) -> list[str]:
         """Build -e KEY=VALUE args for injecting host env vars into init_session.
@@ -1023,6 +1870,8 @@ class DockerEnvironment(BaseEnvironment):
         These are used once during init_session() so that export -p captures
         them into the snapshot.  Subsequent execute() calls don't need -e flags.
         """
+        if getattr(self, "_strict_mode", False):
+            return []
         exec_env: dict[str, str] = dict(self._env)
 
         explicit_forward_keys = set(self._forward_env)
@@ -1059,6 +1908,12 @@ class DockerEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
+        if getattr(self, "_strict_mode", False):
+            self._revalidate_strict_mounts()
+            self._verify_strict_control_volume()
+            self._verify_strict_control_volume_contents()
+            self._verify_strict_container(require_running=True)
+            self._strict_verified_pre_exec = True
         cmd = [self._docker_exe, "exec"]
         if stdin_data is not None:
             cmd.append("-i")
@@ -1123,7 +1978,7 @@ class DockerEnvironment(BaseEnvironment):
                     )
                     self._container_id = cid
                     logger.info("Recovery: restarted container %s", cid[:12])
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, OSError) as e:
                     logger.warning("Recovery: failed to start container %s: %s", cid[:12], e)
 
         # 2. No reusable container — create a fresh one.
@@ -1325,6 +2180,51 @@ class DockerEnvironment(BaseEnvironment):
                 running = (cid, state)
         return running or first
 
+    def _teardown_strict_container(self, container_id: str) -> None:
+        """Synchronously remove one strict container and prove it is absent."""
+        failures: list[str] = []
+        absent = False
+        for action in (["stop", "-t", "10"], ["rm", "-f"]):
+            try:
+                result = subprocess.run(
+                    [self._docker_exe, *action, container_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+                if result.returncode != 0:
+                    failures.append(f"docker {action[0]} exited {result.returncode}")
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                failures.append(f"docker {action[0]} failed: {exc}")
+
+        try:
+            inspected = subprocess.run(
+                [self._docker_exe, "inspect", container_id],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            if inspected.returncode == 0:
+                failures.append("container still exists after removal")
+            elif any(
+                marker in (inspected.stderr or "").lower()
+                for marker in ("no such object", "no such container")
+            ):
+                absent = True
+            else:
+                failures.append("container absence could not be verified")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            failures.append(f"container absence check failed: {exc}")
+
+        if absent:
+            return
+        if failures:
+            raise RuntimeError("strict Docker teardown failed: " + "; ".join(failures))
+
     def cleanup(self, *, force_remove: bool = False):
         """Tear down the container according to persist mode and *force_remove*.
 
@@ -1369,6 +2269,10 @@ class DockerEnvironment(BaseEnvironment):
         """
         container_id = self._container_id
         if not container_id:
+            if getattr(self, "_strict_mode", False) and getattr(
+                self, "_strict_control_volume", ""
+            ):
+                self._teardown_strict_control_volume()
             # Still drop the bind-mount dirs if any were allocated and we're
             # NOT in persist mode (persist mode preserves them).
             if not self._persistent:
@@ -1398,6 +2302,32 @@ class DockerEnvironment(BaseEnvironment):
         else:
             should_stop = True
             should_remove = True
+
+        if self._strict_mode and should_remove:
+            cleanup_error: Exception | None = None
+            try:
+                self._teardown_strict_container(container_id)
+            except Exception as exc:
+                cleanup_error = exc
+            else:
+                self._container_id = None
+            if getattr(self, "_strict_control_volume", ""):
+                try:
+                    self._teardown_strict_control_volume()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                    else:
+                        cleanup_error.add_note(
+                            f"strict control volume cleanup also failed: {exc}"
+                        )
+            if cleanup_error is not None:
+                raise cleanup_error
+            if not self._persistent:
+                for d in (self._workspace_dir, self._home_dir):
+                    if d:
+                        shutil.rmtree(d, ignore_errors=True)
+            return
 
         # Capture state needed by the worker before we null out the attrs —
         # the worker thread can outlive ``self``.

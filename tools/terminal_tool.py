@@ -1193,6 +1193,20 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+def _parse_closed_bool_env(name: str, default: bool = False) -> bool:
+    """Parse an explicit true/false setting; reject ambiguous spellings."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized not in {"true", "false"}:
+        raise ValueError(
+            f"Invalid value for {name}: {raw!r} (expected true or false). "
+            f"Check ~/.hermes/.env or environment variables."
+        )
+    return normalized == "true"
+
+
 def _safe_getcwd() -> str:
     """Return the current working directory, tolerating a deleted CWD.
 
@@ -1281,11 +1295,24 @@ def _get_env_config() -> Dict[str, Any]:
         docker_volumes = _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON")
         docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON")
         docker_extra_args = _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON")
+        docker_strict_mounts = _parse_env_var("TERMINAL_DOCKER_STRICT_MOUNTS", "[]", json.loads, "valid JSON")
+        docker_strict_control_source = os.getenv("TERMINAL_DOCKER_STRICT_CONTROL_SOURCE", "")
+        docker_strict_control_lane = os.getenv("TERMINAL_DOCKER_STRICT_CONTROL_LANE", "")
+        docker_strict_control_manifest_digest = os.getenv("TERMINAL_DOCKER_STRICT_CONTROL_MANIFEST_DIGEST", "")
     else:
         docker_forward_env = []
         docker_volumes = []
         docker_env = {}
         docker_extra_args = []
+        docker_strict_mounts = []
+        docker_strict_control_source = ""
+        docker_strict_control_lane = ""
+        docker_strict_control_manifest_digest = ""
+
+    docker_strict_mode = (
+        _parse_closed_bool_env("TERMINAL_DOCKER_STRICT_MODE")
+        if docker_backend else False
+    )
 
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, and everything else starts in the backend's default
@@ -1294,6 +1321,8 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif docker_strict_mode:
+        default_cwd = "/workspace"
     else:
         default_cwd = "/root"
 
@@ -1333,6 +1362,11 @@ def _get_env_config() -> Dict[str, Any]:
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
+        "docker_strict_mode": docker_strict_mode,
+        "docker_strict_mounts": docker_strict_mounts,
+        "docker_strict_control_source": docker_strict_control_source,
+        "docker_strict_control_lane": docker_strict_control_lane,
+        "docker_strict_control_manifest_digest": docker_strict_control_manifest_digest,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
@@ -1444,6 +1478,11 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            strict_mode=cc.get("docker_strict_mode", False),
+            strict_mounts=cc.get("docker_strict_mounts", []),
+            strict_control_source=cc.get("docker_strict_control_source") or None,
+            strict_control_lane=cc.get("docker_strict_control_lane") or None,
+            strict_control_manifest_digest=cc.get("docker_strict_control_manifest_digest") or None,
         )
     
     elif env_type == "singularity":
@@ -2214,6 +2253,11 @@ def terminal_tool(
                                 "docker_network": config.get("docker_network", True),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "docker_strict_mode": config.get("docker_strict_mode", False),
+                                "docker_strict_mounts": config.get("docker_strict_mounts", []),
+                                "docker_strict_control_source": config.get("docker_strict_control_source", ""),
+                                "docker_strict_control_lane": config.get("docker_strict_control_lane", ""),
+                                "docker_strict_control_manifest_digest": config.get("docker_strict_control_manifest_digest", ""),
                             }
 
                         local_config = None

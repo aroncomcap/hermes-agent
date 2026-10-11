@@ -683,8 +683,18 @@ def _get_or_create_env(task_id: str):
                 "container_disk": config.get("container_disk", 51200),
                 "container_persistent": config.get("container_persistent", True),
                 "docker_volumes": config.get("docker_volumes", []),
+                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False) if config.get("docker_strict_mode", False) else False,
+                "docker_forward_env": config.get("docker_forward_env", []) if config.get("docker_strict_mode", False) else [],
+                "docker_env": config.get("docker_env", {}) if config.get("docker_strict_mode", False) else {},
+                "docker_extra_args": config.get("docker_extra_args", []) if config.get("docker_strict_mode", False) else [],
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_network": config.get("docker_network", True),
+                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+                "docker_strict_mode": config.get("docker_strict_mode", False),
+                "docker_strict_mounts": config.get("docker_strict_mounts", []),
+                "docker_strict_control_source": config.get("docker_strict_control_source", ""),
+                "docker_strict_control_lane": config.get("docker_strict_control_lane", ""),
+                "docker_strict_control_manifest_digest": config.get("docker_strict_control_manifest_digest", ""),
             }
 
         ssh_config = None
