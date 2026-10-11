@@ -530,19 +530,17 @@ class TestRefreshOauthToken:
             "expiresAt": int(time.time() * 1000) - 3600_000,
         }
 
-        mock_response = json.dumps({
+        mock_response = {
             "access_token": "new-token-abc",
             "refresh_token": "new-refresh-456",
             "expires_in": 7200,
-        }).encode()
+        }
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__ = MagicMock(return_value=MagicMock(
-                read=MagicMock(return_value=mock_response)
-            ))
-            mock_ctx.__exit__ = MagicMock(return_value=False)
-            mock_urlopen.return_value = mock_ctx
+        with patch("httpx.Client") as mock_client:
+            response = MagicMock()
+            response.json.return_value = mock_response
+            client = mock_client.return_value.__enter__.return_value
+            client.post.return_value = response
 
             result = _refresh_oauth_token(creds)
 

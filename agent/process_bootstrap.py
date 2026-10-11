@@ -171,8 +171,14 @@ def build_keepalive_http_client(
     """
     try:
         import httpx
+        from hermes_cli.guarded_httpx import (
+            GuardedAsyncHTTPTransport,
+            GuardedHTTPTransport,
+            build_origin_classifier,
+        )
 
-        proxy = _get_proxy_for_base_url(base_url)
+        guarded_base_url = base_url or "https://api.openai.com/v1"
+        proxy = _get_proxy_for_base_url(guarded_base_url)
 
         limits = httpx.Limits(
             max_keepalive_connections=20,
@@ -182,23 +188,36 @@ def build_keepalive_http_client(
         # Generous read=None for SSE streaming endpoints.
         timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)
 
-        transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
         client_cls = httpx.AsyncClient if async_mode else httpx.Client
-        mounts = {}
-        if proxy is None:
-            mounts = {
-                "http://": transport_cls(verify=verify),
-                "https://": transport_cls(verify=verify),
-            }
+        classifier = build_origin_classifier(
+            [guarded_base_url], methods={"POST"}, operation="model_inference"
+        )
+        if async_mode:
+            inner_transport = httpx.AsyncHTTPTransport(
+                verify=verify, proxy=proxy, limits=limits, retries=0
+            )
+            transport = GuardedAsyncHTTPTransport(
+                classifier,
+                request_type="model_inference",
+                transport=inner_transport,
+            )
+        else:
+            inner_transport = httpx.HTTPTransport(
+                verify=verify, proxy=proxy, limits=limits, retries=0
+            )
+            transport = GuardedHTTPTransport(
+                classifier,
+                request_type="model_inference",
+                transport=inner_transport,
+            )
         return client_cls(
             limits=limits,
             timeout=timeout,
-            proxy=proxy,
-            mounts=mounts or None,
-            verify=verify,
+            transport=transport,
+            trust_env=False,
         )
-    except Exception:
-        return None
+    except ImportError as exc:
+        raise RuntimeError("guarded inference transport is unavailable") from exc
 
 
 def _install_safe_stdio() -> None:

@@ -751,7 +751,9 @@ def build_anthropic_client(
 
     normalize_proxy_env_vars()
 
+    import httpx
     from httpx import Timeout
+    from hermes_cli.guarded_httpx import GuardedHTTPTransport, build_origin_classifier
 
     normalized_base_url = _normalize_base_url_text(base_url)
     if normalized_base_url:
@@ -767,6 +769,20 @@ def build_anthropic_client(
         # refill for minutes. (#26293)
         "max_retries": 0,
     }
+    guarded_base_url = normalized_base_url or "https://api.anthropic.com"
+    classifier = build_origin_classifier(
+        [guarded_base_url], methods={"POST"}, operation="model_inference"
+    )
+    kwargs["http_client"] = httpx.Client(
+        transport=GuardedHTTPTransport(
+            classifier,
+            request_type="model_inference",
+            transport=httpx.HTTPTransport(retries=0),
+        ),
+        timeout=kwargs["timeout"],
+        follow_redirects=False,
+        trust_env=False,
+    )
     if normalized_base_url:
         # Azure Anthropic endpoints require an ``api-version`` query parameter.
         # Pass it via default_query so the SDK appends it to every request URL
@@ -1013,7 +1029,8 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
     """Refresh an Anthropic OAuth token without mutating local credential files."""
     import time
     import urllib.parse
-    import urllib.request
+    import httpx
+    from hermes_cli.guarded_httpx import GuardedHTTPTransport, build_origin_classifier
 
     if not refresh_token:
         raise ValueError("refresh_token is required")
@@ -1038,35 +1055,51 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
         "https://platform.claude.com/v1/oauth/token",
         "https://console.anthropic.com/v1/oauth/token",
     ]
+    classifier = build_origin_classifier(
+        token_endpoints,
+        methods={"POST"},
+        operation="anthropic_oauth_refresh",
+        exact_path=True,
+    )
+    transport = GuardedHTTPTransport(
+        classifier,
+        request_type="oauth_refresh",
+        transport=httpx.HTTPTransport(retries=0),
+    )
     last_error = None
-    for endpoint in token_endpoints:
-        req = urllib.request.Request(
-            endpoint,
-            data=data,
-            headers={
-                "Content-Type": content_type,
-                "User-Agent": _OAUTH_TOKEN_USER_AGENT,
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read().decode())
-        except Exception as exc:
-            last_error = exc
-            logger.debug("Anthropic token refresh failed at %s: %s", endpoint, exc)
-            continue
+    with httpx.Client(
+        transport=transport,
+        timeout=10,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        for endpoint in token_endpoints:
+            try:
+                response = client.post(
+                    endpoint,
+                    content=data,
+                    headers={
+                        "Content-Type": content_type,
+                        "User-Agent": _OAUTH_TOKEN_USER_AGENT,
+                    },
+                )
+                response.raise_for_status()
+                result = response.json()
+            except Exception as exc:
+                last_error = exc
+                logger.debug("Anthropic token refresh failed at %s: %s", endpoint, exc)
+                continue
 
-        access_token = result.get("access_token", "")
-        if not access_token:
-            raise ValueError("Anthropic refresh response was missing access_token")
-        next_refresh = result.get("refresh_token", refresh_token)
-        expires_in = result.get("expires_in", 3600)
-        return {
-            "access_token": access_token,
-            "refresh_token": next_refresh,
-            "expires_at_ms": int(time.time() * 1000) + (expires_in * 1000),
-        }
+            access_token = result.get("access_token", "")
+            if not access_token:
+                raise ValueError("Anthropic refresh response was missing access_token")
+            next_refresh = result.get("refresh_token", refresh_token)
+            expires_in = result.get("expires_in", 3600)
+            return {
+                "access_token": access_token,
+                "refresh_token": next_refresh,
+                "expires_at_ms": int(time.time() * 1000) + (expires_in * 1000),
+            }
 
     if last_error is not None:
         raise last_error
