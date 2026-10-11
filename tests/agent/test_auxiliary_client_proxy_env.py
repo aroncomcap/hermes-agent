@@ -15,11 +15,22 @@ from agent.process_bootstrap import _get_proxy_for_base_url
 
 
 def _pool_types(http_client) -> list:
-    return [
-        type(mount._pool).__name__
-        for mount in http_client._mounts.values()
-        if mount is not None and hasattr(mount, "_pool")
-    ]
+    """Return pool types through httpx mounts and Hermes transport wrappers."""
+    pool_types = []
+    pending = [http_client._transport, *http_client._mounts.values()]
+    seen = set()
+    while pending:
+        transport = pending.pop()
+        if transport is None or id(transport) in seen:
+            continue
+        seen.add(id(transport))
+        pool = getattr(transport, "_pool", None)
+        if pool is not None:
+            pool_types.append(type(pool).__name__)
+        inner = getattr(transport, "_transport", None)
+        if inner is not None:
+            pending.append(inner)
+    return pool_types
 
 
 @patch("agent.auxiliary_client.OpenAI")
