@@ -112,6 +112,24 @@ def check_slack_requirements() -> bool:
     return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
 
 
+def _guard_slack_client(client: Any) -> Any:
+    """Wrap the Slack SDK's central API call boundary exactly once."""
+    if getattr(client, "_hermes_external_request_guard", False):
+        return client
+
+    original_api_call = client.api_call
+
+    async def guarded_api_call(api_method: str, *args: Any, **kwargs: Any) -> Any:
+        from hermes_cli.external_request_guard import guard_external_request
+
+        with guard_external_request("slack_api", str(api_method)):
+            return await original_api_call(api_method, *args, **kwargs)
+
+    client.api_call = guarded_api_call
+    client._hermes_external_request_guard = True
+    return client
+
+
 def _extract_text_from_slack_blocks(blocks: list) -> str:
     """Extract readable text from Slack Block Kit blocks, including quoted/forwarded content.
 
@@ -1051,11 +1069,13 @@ class SlackAdapter(BasePlatformAdapter):
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
             self._app = AsyncApp(token=primary_token)
+            _guard_slack_client(self._app.client)
             _apply_slack_proxy(self._app.client, proxy_url)
 
             # Register each bot token and map team_id → client
             for token in bot_tokens:
                 client = AsyncWebClient(token=token)
+                _guard_slack_client(client)
                 _apply_slack_proxy(client, proxy_url)
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")

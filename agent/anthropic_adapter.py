@@ -1039,6 +1039,8 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
         "https://console.anthropic.com/v1/oauth/token",
     ]
     last_error = None
+    from hermes_cli.external_request_guard import ExternalRequestBlocked, guard_external_request
+
     for endpoint in token_endpoints:
         req = urllib.request.Request(
             endpoint,
@@ -1050,8 +1052,11 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read().decode())
+            with guard_external_request("oauth_refresh", "anthropic"):
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    result = json.loads(resp.read().decode())
+        except ExternalRequestBlocked:
+            raise
         except Exception as exc:
             last_error = exc
             logger.debug("Anthropic token refresh failed at %s: %s", endpoint, exc)

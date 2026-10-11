@@ -3426,15 +3426,18 @@ def refresh_codex_oauth_pure(
             "User-Agent": CODEX_OAUTH_USER_AGENT,
         },
     ) as client:
-        response = client.post(
-            CODEX_OAUTH_TOKEN_URL,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": CODEX_OAUTH_CLIENT_ID,
-            },
-        )
+        from hermes_cli.external_request_guard import guard_external_request
+
+        with guard_external_request("oauth_refresh", "openai_codex"):
+            response = client.post(
+                CODEX_OAUTH_TOKEN_URL,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": CODEX_OAUTH_CLIENT_ID,
+                },
+            )
 
     if response.status_code == 429:
         # Upstream rate-limit / usage-quota exhaustion on the token endpoint.

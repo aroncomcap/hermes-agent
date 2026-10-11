@@ -68,6 +68,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
+from hermes_cli.external_request_guard import ExternalRequestBlocked, guard_external_request
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
@@ -1318,17 +1319,26 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
-                    if agent.api_mode == "codex_responses":
-                        next_api_kwargs = agent._get_transport().preflight_kwargs(
-                            next_api_kwargs,
-                            allow_stream=False,
-                            is_github_responses=agent._is_copilot_url(),
-                        )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    with guard_external_request(
+                        "inference",
+                        "model_request",
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        provider=agent.provider,
+                        model=agent.model,
+                    ):
+                        if agent.api_mode == "codex_responses":
+                            next_api_kwargs = agent._get_transport().preflight_kwargs(
+                                next_api_kwargs,
+                                allow_stream=False,
+                                is_github_responses=agent._is_copilot_url(),
+                            )
+                        if _use_streaming:
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        return agent._interruptible_api_call(next_api_kwargs)
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -2285,6 +2295,8 @@ def run_conversation(
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
+            except ExternalRequestBlocked:
+                raise
             except InterruptedError:
                 if thinking_spinner:
                     thinking_spinner.stop("")

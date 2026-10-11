@@ -157,6 +157,12 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # Security-sensitive external request lifecycle. Unlike observer hooks,
+    # pre_external_request is invoked through a fail-closed helper and may
+    # veto the request. post_external_request always runs for an admitted
+    # request so policy plugins can release request-scoped leases/locks.
+    "pre_external_request",
+    "post_external_request",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -1924,6 +1930,20 @@ class PluginManager:
                 )
         return results
 
+    def invoke_hook_strict(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Call hook callbacks without swallowing failures.
+
+        This is reserved for security gates where a broken policy callback
+        must fail closed instead of silently allowing the protected action.
+        """
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[Any] = []
+        for cb in self._hooks.get(hook_name, []):
+            ret = cb(**kwargs)
+            if ret is not None:
+                results.append(ret)
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2050,6 +2070,15 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_hook_strict(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke a fail-closed lifecycle hook.
+
+    Callers must translate callback failures into a denied operation and run
+    any paired cleanup hook. Normal observer hooks should use invoke_hook().
+    """
+    return get_plugin_manager().invoke_hook_strict(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
