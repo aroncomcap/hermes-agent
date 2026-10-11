@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "codex@comcapllc.com": "aroncomcap",  # COM-17900: Codex automation acting for the repository owner
     "coder-platform@comcap.ai": "aroncomcap",  # COM-17822: Coder-Platform automation acting for the repository owner
     "neo@comcapllc.com": "aroncomcap",  # COM-17839 (and COM-17822): host commits from the neo mailbox
     "wilsonkinyuam@gmail.com": "WilsonKinyua",  # PR #62052 (tui: persist unflushed conversations on disconnect/restart)
