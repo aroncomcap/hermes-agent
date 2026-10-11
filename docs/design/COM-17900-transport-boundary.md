@@ -23,7 +23,9 @@ The generic policy API is split into two primitives:
 - `finish_external_request(permit, outcome) -> None`
 
 `begin_external_request` always creates an opaque request ID, invokes all strict
-pre-hooks, and emits its own `denied` completion if policy blocks or fails. It
+pre-hooks, and emits its own `denied` completion if policy blocks or fails. The
+authorization-generation store and required pre-egress audit sink must both be
+healthy before it returns; their unavailability fails closed. It
 never includes request bodies, headers, URLs, tokens, filenames, response data,
 or exception text. `finish_external_request` is best-effort and idempotent. A
 small synchronous context manager remains for transports that expose one attempt
@@ -45,6 +47,8 @@ SDK retry handlers remain installed. Each retry calls `session.request` again,
 so each attempt receives a fresh permit. The operation label is a fixed
 classification (`slack_web_api`, `slack_file_upload`, or `slack_socket_handshake`)
 derived from a host/path allowlist; raw URLs and query strings never enter hooks.
+An unmatched host/path is denied before transport invocation; there is no generic
+or fallback destination classification.
 
 Redirect following is forbidden for protected Slack requests. A public
 `on_request_redirect` trace callback raises before aiohttp transmits the redirected
@@ -52,8 +56,11 @@ request. Slack endpoints are expected to return their documented terminal
 responses; an unexpected redirect fails closed and is diagnosable by a
 names-only operation label. This makes one `session.request` attempt one protected
 HTTP transmission even when the remote endpoint is hostile or misconfigured. The
-redirect callback finishes the current permit as failed before raising; later
-end/exception callbacks are harmless because completion is idempotent.
+redirect response completes the original permit as `completed`. Before following,
+the callback requests a new permit for the classified redirect destination; the
+redirect policy denies it and emits its paired `denied` completion, so no second
+request is transmitted. Later callbacks are harmless because completion is
+idempotent.
 
 ### Slack Socket Mode
 
@@ -70,9 +77,13 @@ outbound `send_str` and `send_bytes` application-frame attempt independently.
 Inbound receives and payload-free heartbeat/close protocol frames are not
 protected application side effects. Existing Socket Mode reconnect and send
 retry loops remain unchanged; their repeated handshake or application-frame
-calls each request a new permit. Revoking an authorization generation also closes
-the established socket, so no later application frame can reuse an admitted
-connection after revocation.
+calls each request a new permit. One adapter-owned asynchronous lock serializes
+authorization-generation changes and socket application writes. Each `send_str`
+or `send_bytes` holds that lock while it rechecks the active generation, obtains
+its permit, and performs the frame write. Revocation takes the same lock, advances
+the generation, and closes the socket before releasing it. A frame already being
+written may complete under its admitted generation; no frame can begin after the
+revocation linearization point using the old generation.
 
 The adapter owns and closes both guarded sessions during shutdown. Tests assert
 that the SDK-created replaced session is closed exactly once and that no
@@ -92,7 +103,11 @@ high-level wrapper is not an accepted fallback.
 The guarded transport wraps the returned response stream. For streaming, the
 permit remains open until the response iterator is exhausted, closed, or raises.
 Completion must not be emitted merely when the response or iterator object is
-returned.
+returned. Each permit also has a bounded lease and an owner-finalizer: explicit
+close/exhaustion records the normal outcome; an abandoned stream is finalized as
+`abandoned` by the lease watchdog (the finalizer only schedules that idempotent
+cleanup). The pairing guarantee applies while the process and audit store are
+running; crash recovery reconciles expired open permits from the durable pre-event.
 
 ### OAuth refresh
 
@@ -105,9 +120,13 @@ generic retry. Hook payloads contain provider and operation labels only.
 
 - No pre-hook installed still produces a permit so post-only audit plugins work.
 - A policy exception fails closed with a generic message and no policy detail.
-- Completion outcomes are `completed`, `failed`, or `denied`; HTTP error status is
-  still a completed wire attempt, while a transport exception is failed.
-- Cleanup hooks cannot mask the transport result.
+- Completion outcomes are `completed`, `failed`, `denied`, or `abandoned`; HTTP
+  error and redirect statuses are completed wire attempts, while a transport
+  exception is failed.
+- Required authorization and durable pre-event recording fail closed before
+  egress. Post-completion hooks are best-effort and cannot mask a result that has
+  already occurred; failures are alerted and reconciled from the durable
+  pre-event/lease rather than pretending the egress can be undone.
 - The active authorization generation is checked in the pre-hook immediately
   before each attempt. Queue and ingress checks remain defense in depth, not a
   substitute for this boundary.
@@ -120,7 +139,8 @@ Use local fake HTTP/WebSocket servers only.
 2. A Slack 503-then-200 retry produces two distinct paired permits while the
    existing retry succeeds.
 3. A presigned upload POST is observed through the same trace boundary; an HTTP
-   redirect is denied before the redirect target observes a request.
+   redirect completes the original permit and produces a paired denial before the
+   redirect target observes a request. Unmatched destinations are also denied.
 4. Socket handshake, reconnect, and text/binary application frames each pass
    through the guard; a retried send obtains a second permit. Heartbeat and close
    controls contain no workload payload, and revocation closes the socket.
@@ -128,7 +148,8 @@ Use local fake HTTP/WebSocket servers only.
 6. Model and OAuth clients prove redirects and transport retries are disabled;
    their guarded transports observe attempts and application retries produce
    distinct permits.
-7. Streaming inference retains the permit through exhaustion, close, and error.
+7. Streaming inference retains the permit through exhaustion, close, and error;
+   abandonment/lease expiry produces a durable `abandoned` completion.
 8. Captured hook payloads contain allowlisted names only and no secret values.
 9. Existing Slack reconnect/upload, provider failover, and OAuth tests remain
    green without altering their retry counts.
@@ -142,7 +163,9 @@ and provider integrations work, paired event counts match attempted egress, and
 no secret-bearing metadata is emitted.
 
 Rollback is the prior signed package/config through the same installer. If the
-guard or audit sink becomes unavailable, protected egress fails closed; health
-and local administrative diagnostics remain available. Credential rotation and
-the dedicated Doppler/DB boundary remain separate mandatory gates and are not
-weakened by this transport change.
+authorization guard, generation store, or durable pre-egress audit sink is
+unavailable, protected egress fails closed; a post-completion sink failure alerts
+and reconciles without changing the completed transport result. Health and local
+administrative diagnostics remain available. Credential rotation and the
+dedicated Doppler/DB boundary remain separate mandatory gates and are not weakened
+by this transport change.
