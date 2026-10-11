@@ -1576,6 +1576,7 @@ AUTHOR_MAP = {
     "paul@gamma.app": "Paul Bergeron",
     "zhangxicen@example.com": "zhangxicen",
     "codex@openai.invalid": "teknium1",
+    "codex@comcapllc.com": "Codex",  # ComCap automation; excluded from contributor lists
     "screenmachine@gmail.com": "teknium1",
     "chenzeshi@live.com": "chen1749144759",
     "mor.aleksandr@yahoo.com": "MorAlekss",
