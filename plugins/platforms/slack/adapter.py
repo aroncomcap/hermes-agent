@@ -486,16 +486,39 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Disabled by default. In brokered mode the gateway holds neither
+        # Slack credentials nor an Internet socket; all egress is Unix IPC.
+        self._brokered_egress = bool(config.extra.get("brokered_egress", False))
+        self._broker_client: Optional[Any] = None
+        self._broker_transport: Optional[Any] = None
+        if self._brokered_egress:
+            try:
+                from . import brokered as broker_transport
+            except ImportError:  # pragma: no cover - flat plugin-dir import
+                import brokered as broker_transport  # type: ignore
+
+            self._broker_transport = broker_transport
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
-        if not self._app or not self._app_token:
-            raise RuntimeError("Socket Mode requires an initialized app and app token")
+        if not self._app:
+            raise RuntimeError("Socket Mode requires an initialized app")
 
-        self._handler = AsyncSocketModeHandler(
-            self._app, self._app_token, proxy=self._proxy_url
-        )
-        _apply_slack_proxy(self._handler.client, self._proxy_url)
+        if self._brokered_egress:
+            if self._broker_client is None:
+                raise RuntimeError("brokered Socket Mode requires an IPC client")
+            self._handler = self._broker_transport.BrokeredSocketModeHandler(
+                self._app, self._broker_client
+            )
+        else:
+            if not self._app_token:
+                raise RuntimeError(
+                    "Socket Mode requires an initialized app and app token"
+                )
+            self._handler = AsyncSocketModeHandler(
+                self._app, self._app_token, proxy=self._proxy_url
+            )
+            _apply_slack_proxy(self._handler.client, self._proxy_url)
 
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
@@ -556,7 +579,11 @@ class SlackAdapter(BasePlatformAdapter):
             return
 
         async with self._socket_reconnect_lock:
-            if not self._running or not self._app or not self._app_token:
+            if (
+                not self._running
+                or not self._app
+                or (not self._brokered_egress and not self._app_token)
+            ):
                 return
 
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
@@ -646,6 +673,22 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug(
                 "[Slack] Could not inspect Socket Mode task exception", exc_info=True
             )
+        if (
+            self._broker_transport is not None
+            and isinstance(exc, self._broker_transport.BrokerTerminalDenied)
+        ):
+            logger.critical("[Slack] Broker policy denied the gateway: %s", exc)
+            self._set_fatal_error(
+                "broker_policy_denied",
+                str(exc),
+                retryable=False,
+            )
+            # The runner converts this specific terminal policy failure to
+            # EX_CONFIG=78 after its normal cleanup path. Do not restart the
+            # adapter or throw from an asyncio done callback (which cannot
+            # reliably determine process exit status).
+            asyncio.create_task(self._notify_fatal_error())
+            return
 
         if exc is not None:
             logger.warning(
@@ -820,6 +863,21 @@ class SlackAdapter(BasePlatformAdapter):
             "text": text,
         }
         try:
+            if self._brokered_egress:
+                if self._broker_client is None:
+                    raise RuntimeError("brokered Slack transport is not connected")
+                result = await self._broker_client.http_request(
+                    method="POST",
+                    url=ctx["response_url"],
+                    json_body=payload,
+                )
+                status = int(result.get("status", 0))
+                if status == 200:
+                    return SendResult(success=True, message_id=None)
+                logger.warning(
+                    "[Slack] brokered response_url POST returned %s", status
+                )
+                return SendResult(success=True, message_id=None)
             async with aiohttp.ClientSession(trust_env=True) as session:
                 async with session.post(
                     ctx["response_url"],
@@ -959,31 +1017,48 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return False
 
-        raw_token = self.config.token
-        app_token = os.getenv("SLACK_APP_TOKEN")
+        app_token: Optional[str] = None
+        proxy_url: Optional[str] = None
+        bot_tokens: List[str] = []
+        broker_auth: List[Dict[str, Any]] = []
+        if self._brokered_egress:
+            from hermes_cli.profiles import get_active_profile_name
 
-        if not raw_token:
-            logger.error("[Slack] SLACK_BOT_TOKEN not set")
-            return False
-        if not app_token:
-            logger.error("[Slack] SLACK_APP_TOKEN not set")
-            return False
-
-        proxy_url = _resolve_slack_proxy_url()
-        if proxy_url:
-            logger.info(
-                "[Slack] Using proxy for Slack transport: %s",
-                safe_url_for_log(proxy_url),
+            profile_id = get_active_profile_name() or "default"
+            socket_value = self.config.extra.get("broker_socket")
+            socket_path = (
+                _Path(str(socket_value)).expanduser()
+                if socket_value
+                else self._broker_transport.default_broker_socket_path()
             )
-
-        # Support comma-separated bot tokens for multi-workspace
-        bot_tokens = [t.strip() for t in raw_token.split(",") if t.strip()]
+            self._broker_client = self._broker_transport.BrokerIPCClient(
+                self._broker_transport.BrokerSettings(
+                    socket_path=socket_path, profile_id=profile_id
+                )
+            )
+            broker_auth = await self._broker_client.slack_auth_list()
+        else:
+            raw_token = self.config.token
+            app_token = os.getenv("SLACK_APP_TOKEN")
+            if not raw_token:
+                logger.error("[Slack] SLACK_BOT_TOKEN not set")
+                return False
+            if not app_token:
+                logger.error("[Slack] SLACK_APP_TOKEN not set")
+                return False
+            proxy_url = _resolve_slack_proxy_url()
+            if proxy_url:
+                logger.info(
+                    "[Slack] Using proxy for Slack transport: %s",
+                    safe_url_for_log(proxy_url),
+                )
+            bot_tokens = [t.strip() for t in raw_token.split(",") if t.strip()]
 
         # Also load tokens from OAuth token file
         from hermes_constants import get_hermes_home
 
         tokens_file = get_hermes_home() / "slack_tokens.json"
-        if tokens_file.exists():
+        if not self._brokered_egress and tokens_file.exists():
             try:
                 saved = json.loads(tokens_file.read_text(encoding="utf-8"))
                 for team_id, entry in saved.items():
@@ -1003,9 +1078,19 @@ class SlackAdapter(BasePlatformAdapter):
 
         lock_acquired = False
         try:
-            if not self._acquire_platform_lock(
-                "slack-app-token", app_token, "Slack app token"
-            ):
+            if self._brokered_egress:
+                lock_identity = (
+                    f"{self._broker_client.settings.profile_id}:"
+                    f"{self._broker_client.settings.socket_path}"
+                )
+                acquired = self._acquire_platform_lock(
+                    "slack-broker-profile", lock_identity, "Slack broker profile"
+                )
+            else:
+                acquired = self._acquire_platform_lock(
+                    "slack-app-token", app_token, "Slack app token"
+                )
+            if not acquired:
                 return False
             lock_acquired = True
             self._running = False
@@ -1049,20 +1134,47 @@ class SlackAdapter(BasePlatformAdapter):
             self._team_bot_user_ids = {}
 
             # First token is the primary — used for AsyncApp / Socket Mode
-            primary_token = bot_tokens[0]
-            self._app = AsyncApp(token=primary_token)
-            _apply_slack_proxy(self._app.client, proxy_url)
+            if self._brokered_egress:
+                primary_auth = broker_auth[0]
+                primary_team_id = str(primary_auth.get("team_id") or "")
+                if not primary_team_id:
+                    raise RuntimeError("broker returned Slack identity without team_id")
+                self._app = self._broker_transport.BrokeredAsyncApp(
+                    self._broker_client,
+                    broker_auth,
+                )
+                primary_client = self._app.client
+                auth_clients = [
+                    (
+                        auth,
+                        primary_client
+                        if i == 0
+                        else self._broker_transport.BrokeredAsyncWebClient(
+                            self._broker_client,
+                            workspace_id=str(auth.get("team_id") or ""),
+                        ),
+                    )
+                    for i, auth in enumerate(broker_auth)
+                ]
+            else:
+                primary_token = bot_tokens[0]
+                self._app = AsyncApp(token=primary_token)
+                _apply_slack_proxy(self._app.client, proxy_url)
+                auth_clients = []
+                for token in bot_tokens:
+                    client = AsyncWebClient(token=token)
+                    _apply_slack_proxy(client, proxy_url)
+                    auth_clients.append((await client.auth_test(), client))
 
             # Register each bot token and map team_id → client
-            for token in bot_tokens:
-                client = AsyncWebClient(token=token)
-                _apply_slack_proxy(client, proxy_url)
-                auth_response = await client.auth_test()
+            for auth_response, client in auth_clients:
                 team_id = auth_response.get("team_id", "")
                 bot_user_id = auth_response.get("user_id", "")
                 bot_name = auth_response.get("user", "unknown")
                 team_name = auth_response.get("team", "unknown")
 
+                if not team_id or not bot_user_id:
+                    raise RuntimeError("broker returned incomplete Slack identity")
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id
 
@@ -1246,7 +1358,9 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 self._start_socket_mode_handler()
                 self._running = True
-                self._ensure_socket_watchdog()
+                # BrokerSocketModeClient owns retry/backoff and terminal denial.
+                if not self._brokered_egress:
+                    self._ensure_socket_watchdog()
             except Exception:
                 self._running = False
                 try:
@@ -1337,6 +1451,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._app = None
         self._app_token = None
         self._proxy_url = None
+        self._broker_client = None
 
         self._release_platform_lock()
 
@@ -1747,10 +1862,13 @@ class SlackAdapter(BasePlatformAdapter):
 
             file_uploads: List[Dict[str, Any]] = []
             initial_comment_parts: List[str] = []
+            http_client = None
             try:
-                async with _httpx.AsyncClient(
-                    timeout=30.0, follow_redirects=True
-                ) as http_client:
+                if not self._brokered_egress:
+                    http_client = _httpx.AsyncClient(
+                        timeout=30.0, follow_redirects=True
+                    )
+                try:
                     for image_url, alt_text in chunk:
                         if alt_text:
                             initial_comment_parts.append(alt_text)
@@ -1775,10 +1893,24 @@ class SlackAdapter(BasePlatformAdapter):
                                 )
                                 continue
                             try:
-                                response = await http_client.get(image_url)
-                                response.raise_for_status()
+                                if self._brokered_egress:
+                                    result = await self._broker_client.http_request(
+                                        method="GET", url=image_url
+                                    )
+                                    if int(result.get("status", 0)) >= 400:
+                                        raise RuntimeError("brokered image download failed")
+                                    content = self._broker_transport.decode_bytes(
+                                        result.get("body")
+                                    )
+                                    headers = result.get("headers") or {}
+                                else:
+                                    assert http_client is not None
+                                    response = await http_client.get(image_url)
+                                    response.raise_for_status()
+                                    content = response.content
+                                    headers = response.headers
                                 ext = "png"
-                                ct = response.headers.get("content-type", "")
+                                ct = headers.get("content-type", "")
                                 if "jpeg" in ct or "jpg" in ct:
                                     ext = "jpg"
                                 elif "gif" in ct:
@@ -1787,7 +1919,7 @@ class SlackAdapter(BasePlatformAdapter):
                                     ext = "webp"
                                 file_uploads.append(
                                     {
-                                        "content": response.content,
+                                        "content": content,
                                         "filename": f"image_{len(file_uploads)}.{ext}",
                                     }
                                 )
@@ -1798,6 +1930,9 @@ class SlackAdapter(BasePlatformAdapter):
                                     dl_err,
                                 )
                                 continue
+                finally:
+                    if http_client is not None:
+                        await http_client.aclose()
 
                 if not file_uploads:
                     continue
@@ -2168,18 +2303,29 @@ class SlackAdapter(BasePlatformAdapter):
                     raise ValueError("Blocked redirect to private/internal address")
 
             # Download the image first
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                follow_redirects=True,
-                event_hooks={"response": [_ssrf_redirect_guard]},
-            ) as client:
-                response = await client.get(image_url)
-                response.raise_for_status()
+            if self._brokered_egress:
+                result = await self._broker_client.http_request(
+                    method="GET", url=image_url
+                )
+                if int(result.get("status", 0)) >= 400:
+                    raise RuntimeError("brokered image download failed")
+                image_content = self._broker_transport.decode_bytes(
+                    result.get("body")
+                )
+            else:
+                async with httpx.AsyncClient(
+                    timeout=30.0,
+                    follow_redirects=True,
+                    event_hooks={"response": [_ssrf_redirect_guard]},
+                ) as client:
+                    response = await client.get(image_url)
+                    response.raise_for_status()
+                    image_content = response.content
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             result = await self._get_client(chat_id).files_upload_v2(
                 channel=chat_id,
-                content=response.content,
+                content=image_content,
                 filename="image.png",
                 initial_comment=caption or "",
                 thread_ts=thread_ts,
@@ -4048,6 +4194,26 @@ class SlackAdapter(BasePlatformAdapter):
         self, url: str, ext: str, audio: bool = False, team_id: str = ""
     ) -> str:
         """Download a Slack file using the bot token for auth, with retry."""
+        if self._brokered_egress:
+            workspace_id = team_id or None
+            result = await self._broker_client.http_request(
+                method="GET",
+                url=url,
+                workspace_id=workspace_id,
+                slack_authorized=True,
+            )
+            if int(result.get("status", 0)) >= 400:
+                raise RuntimeError("brokered Slack file download failed")
+            content = self._broker_transport.decode_bytes(result.get("body"))
+            ct = str((result.get("headers") or {}).get("content-type", ""))
+            if "text/html" in ct:
+                raise ValueError("Slack returned HTML instead of media")
+            if audio:
+                from gateway.platforms.base import cache_audio_from_bytes
+                return cache_audio_from_bytes(content, ext)
+            from gateway.platforms.base import cache_image_from_bytes
+            return cache_image_from_bytes(content, ext)
+
         import httpx
 
         bot_token = (
@@ -4104,6 +4270,20 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _download_slack_file_bytes(self, url: str, team_id: str = "") -> bytes:
         """Download a Slack file and return raw bytes, with retry."""
+        if self._brokered_egress:
+            result = await self._broker_client.http_request(
+                method="GET",
+                url=url,
+                workspace_id=team_id or None,
+                slack_authorized=True,
+            )
+            if int(result.get("status", 0)) >= 400:
+                raise RuntimeError("brokered Slack file download failed")
+            ct = str((result.get("headers") or {}).get("content-type", ""))
+            if "text/html" in ct:
+                raise ValueError("Slack returned HTML instead of file bytes")
+            return self._broker_transport.decode_bytes(result.get("body"))
+
         import httpx
 
         bot_token = (

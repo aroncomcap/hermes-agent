@@ -102,6 +102,32 @@ async def test_runner_queues_retryable_runtime_fatal_for_reconnection(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_broker_policy_denial_requests_terminal_exit_78(tmp_path):
+    config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(enabled=True, token="unused")
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    adapter = _RuntimeRetryableAdapter()
+    adapter._set_fatal_error(
+        "broker_policy_denied",
+        "profile is not authorized",
+        retryable=False,
+    )
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.delivery_router.adapters = runner.adapters
+
+    await runner._handle_adapter_fatal_error(adapter)
+
+    assert runner.exit_code == 78
+    assert runner.should_exit_cleanly is True
+    assert runner.exit_reason == "profile is not authorized"
+    assert Platform.WHATSAPP not in runner._failed_platforms
+
+
+@pytest.mark.asyncio
 async def test_concurrent_fatal_notifications_disconnect_same_adapter_once(monkeypatch, tmp_path):
     """
     Two fatal-error notifications for the same still-installed adapter (e.g.

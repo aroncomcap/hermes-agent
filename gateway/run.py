@@ -4042,6 +4042,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.delivery_router.adapters = self.adapters
             await adapter.disconnect()
 
+        if adapter.fatal_error_code == "broker_policy_denied":
+            # Broker policy denial is an operator/configuration decision, not
+            # a transport outage. Preserve the normal teardown path while
+            # telling systemd/s6 not to restart the gateway indefinitely.
+            reason = adapter.fatal_error_message or "Slack broker policy denied"
+            self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+            self._request_clean_exit(reason)
+            return
+
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
             platform_config = self.config.platforms.get(adapter.platform)

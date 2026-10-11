@@ -1597,7 +1597,17 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         )
 
     # Slack
-    slack_token = getenv("SLACK_BOT_TOKEN")
+    slack_config = config.platforms.get(Platform.SLACK)
+    slack_brokered = (
+        slack_config is not None
+        and bool(slack_config.extra.get("brokered_egress", False))
+    )
+    if slack_config is not None and slack_brokered:
+        # Brokered egress is a credential boundary: the gateway retains only
+        # the profile/socket selector and must not ingest a Slack credential
+        # from either YAML or its ambient environment.
+        slack_config.token = None
+    slack_token = None if slack_brokered else getenv("SLACK_BOT_TOKEN")
     if slack_token:
         if Platform.SLACK not in config.platforms:
             # No yaml config for Slack — env-only setup, enable it
