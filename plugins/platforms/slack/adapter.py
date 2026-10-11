@@ -117,7 +117,9 @@ def _guard_slack_client(client: Any) -> Any:
     if getattr(client, "_hermes_external_request_guard", False):
         return client
 
-    original_api_call = client.api_call
+    original_api_call = getattr(client, "api_call", None)
+    if not callable(original_api_call):
+        return client
 
     async def guarded_api_call(api_method: str, *args: Any, **kwargs: Any) -> Any:
         from hermes_cli.external_request_guard import guard_external_request

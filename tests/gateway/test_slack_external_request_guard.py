@@ -53,3 +53,10 @@ async def test_slack_client_gate_wraps_once():
         manager._hooks = old
 
     assert calls == ["auth.test"]
+
+
+def test_slack_client_gate_ignores_clients_without_api_call_surface():
+    client = SimpleNamespace(auth_test=lambda: {"ok": True})
+
+    assert _guard_slack_client(client) is client
+    assert not hasattr(client, "_hermes_external_request_guard")
