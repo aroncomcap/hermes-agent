@@ -17,7 +17,7 @@ async def test_slack_client_gate_blocks_before_sdk_call():
         calls.append(method)
         return {"ok": True}
 
-    client = SimpleNamespace(api_call=api_call)
+    client = SimpleNamespace(api_call=api_call, retry_handlers=[object()])
     manager = get_plugin_manager()
     old = dict(manager._hooks)
     manager._hooks = {
@@ -41,13 +41,14 @@ async def test_slack_client_gate_wraps_once():
         calls.append(method)
         return {"ok": True}
 
-    client = SimpleNamespace(api_call=api_call)
+    client = SimpleNamespace(api_call=api_call, retry_handlers=[object()])
     manager = get_plugin_manager()
     old = dict(manager._hooks)
     manager._hooks = {"pre_external_request": [lambda **kwargs: None]}
     try:
         assert _guard_slack_client(client) is client
         assert _guard_slack_client(client) is client
+        assert client.retry_handlers == []
         assert await client.api_call("auth.test") == {"ok": True}
     finally:
         manager._hooks = old

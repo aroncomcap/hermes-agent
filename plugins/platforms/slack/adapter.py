@@ -121,6 +121,11 @@ def _guard_slack_client(client: Any) -> Any:
     if not callable(original_api_call):
         return client
 
+    # Keep policy checks one-to-one with wire attempts. Application-level retries
+    # re-enter api_call and therefore re-enter the guard.
+    if hasattr(client, "retry_handlers"):
+        client.retry_handlers = []
+
     async def guarded_api_call(api_method: str, *args: Any, **kwargs: Any) -> Any:
         from hermes_cli.external_request_guard import guard_external_request
 

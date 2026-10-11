@@ -48,11 +48,7 @@ def guard_external_request(
     the hook payload. Policy plugins receive stable request/session identity
     plus the request type and operation only.
     """
-    from hermes_cli.plugins import has_hook, invoke_hook, invoke_hook_strict
-
-    if not has_hook("pre_external_request"):
-        yield ""
-        return
+    from hermes_cli.plugins import invoke_hook, invoke_hook_strict
 
     request_id = uuid.uuid4().hex
     payload: dict[str, Any] = _session_context()

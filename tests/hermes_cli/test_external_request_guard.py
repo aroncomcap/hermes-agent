@@ -19,7 +19,20 @@ def isolated_hooks():
 
 def test_no_listener_is_noop():
     with guard_external_request("inference", "model_request") as request_id:
-        assert request_id == ""
+        assert request_id
+
+
+def test_post_only_listener_observes_admitted_request(isolated_hooks):
+    events = []
+    isolated_hooks._hooks["post_external_request"] = [
+        lambda **kwargs: events.append(kwargs)
+    ]
+
+    with guard_external_request("inference", "model_request") as request_id:
+        assert request_id
+
+    assert events[0]["external_request_id"] == request_id
+    assert events[0]["outcome"] == "completed"
 
 
 def test_block_directive_denies_and_runs_cleanup(isolated_hooks):
