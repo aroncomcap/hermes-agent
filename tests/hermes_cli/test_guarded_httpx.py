@@ -14,6 +14,7 @@ from hermes_cli.external_request_guard import (
 from hermes_cli.guarded_httpx import (
     GuardedAsyncHTTPTransport,
     GuardedHTTPTransport,
+    build_env_http_transport,
     build_origin_classifier,
 )
 from hermes_cli.plugins import get_plugin_manager
@@ -223,3 +224,25 @@ def test_exact_path_classifier_rejects_same_origin_path(local_server):
     assert classifier("POST", httpx.URL(f"{local_server}/token")) == "oauth_refresh"
     with pytest.raises(ExternalRequestBlocked, match="destination denied"):
         classifier("POST", httpx.URL(f"{local_server}/other"))
+
+
+def test_env_transport_preserves_explicit_proxy_and_ca_settings(monkeypatch):
+    captured = {}
+    marker = object()
+
+    monkeypatch.setattr(
+        "agent.process_bootstrap._get_proxy_for_base_url",
+        lambda _base_url: "http://proxy.internal:8080",
+    )
+
+    def build_transport(**kwargs):
+        captured.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(httpx, "HTTPTransport", build_transport)
+
+    assert build_env_http_transport("https://api.openai.com", verify="custom-ca.pem") is marker
+    assert captured["proxy"] == "http://proxy.internal:8080"
+    assert captured["verify"] == "custom-ca.pem"
+    assert captured["trust_env"] is True
+    assert captured["retries"] == 0

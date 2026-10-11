@@ -184,3 +184,131 @@ async def test_socket_application_ack_has_durable_permit(tmp_path, local_server)
         ("text", "hello"),
         ("binary", b"world"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_owned_socket_closes_explicitly_through_guard(tmp_path):
+    journal = tmp_path / "requests.sqlite3"
+    controller = ExternalRequestController(journal)
+
+    class FakeSocket:
+        closed = False
+        close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self):
+            self.close_calls += 1
+            self.closed = True
+
+    socket = FakeSocket()
+
+    class FakeSession:
+        async def ws_connect(self, *_args, **_kwargs):
+            return socket
+
+    class FakeWebClient:
+        async def apps_connections_open(self, **_kwargs):
+            return {"url": "wss://wss-primary.slack.com/link/?ticket=test"}
+
+    handler = OwnedSocketModeHandler(
+        SimpleNamespace(),
+        "xapp-test",
+        web_client=FakeWebClient(),
+        session=FakeSession(),
+        controller=controller,
+    )
+
+    await handler._connect_once()
+
+    assert socket.close_calls == 1
+    with sqlite3.connect(journal) as connection:
+        operations = connection.execute(
+            "SELECT request_type, operation, state FROM external_request_attempts"
+        ).fetchall()
+    assert operations == [("slack_socket_control", "close", "completed")]
+
+
+@pytest.mark.asyncio
+async def test_clean_disconnects_exhaust_bounded_reconnect_budget(tmp_path, monkeypatch):
+    controller = ExternalRequestController(tmp_path / "requests.sqlite3")
+    handler = OwnedSocketModeHandler(
+        SimpleNamespace(),
+        "xapp-test",
+        web_client=SimpleNamespace(),
+        session=SimpleNamespace(),
+        controller=controller,
+        reconnect_limit=3,
+    )
+    attempts = 0
+
+    async def clean_disconnect():
+        nonlocal attempts
+        attempts += 1
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(handler, "_connect_once", clean_disconnect)
+    monkeypatch.setattr(
+        "plugins.platforms.slack.owned_socket_mode.asyncio.sleep", no_sleep
+    )
+
+    with pytest.raises(ConnectionError, match="reconnect limit"):
+        await handler.start_async()
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_slow_dispatch_does_not_starve_ping_control(tmp_path, monkeypatch):
+    controller = ExternalRequestController(tmp_path / "requests.sqlite3")
+    handler = OwnedSocketModeHandler(
+        SimpleNamespace(),
+        "xapp-test",
+        web_client=SimpleNamespace(),
+        session=SimpleNamespace(),
+        controller=controller,
+    )
+    release_dispatch = asyncio.Event()
+    pong_payloads = []
+
+    async def slow_dispatch(_socket, _message):
+        await release_dispatch.wait()
+
+    class FakeSocket:
+        closed = False
+
+        def __init__(self):
+            self._messages = iter(
+                [
+                    SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="{}"),
+                    SimpleNamespace(type=aiohttp.WSMsgType.PING, data=b"probe"),
+                    SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=None),
+                ]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._messages)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def pong(self, payload):
+            pong_payloads.append(payload)
+
+    monkeypatch.setattr(handler, "_dispatch_text", slow_dispatch)
+    socket = FakeSocket()
+
+    await handler._receive(socket)
+
+    assert pong_payloads == [b"probe"]
+    assert len(handler._dispatch_tasks) == 1
+    release_dispatch.set()
+    await handler._cancel_dispatches()

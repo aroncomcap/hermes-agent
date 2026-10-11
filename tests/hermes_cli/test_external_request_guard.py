@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -135,3 +136,70 @@ def test_terminal_sink_failure_does_not_mask_completed_transport(tmp_path, monke
     )
 
     assert controller.complete_sync(permit, "completed") is False
+
+
+def test_revoke_rejects_an_admitted_permit_before_wire_egress(tmp_path):
+    controller = ExternalRequestController(tmp_path / "requests.sqlite3")
+    permit = controller.admit_sync("model_inference", "stream")
+    called = False
+
+    controller.revoke_sync()
+
+    def wire_operation():
+        nonlocal called
+        called = True
+
+    with pytest.raises(ExternalRequestBlocked, match="revoked"):
+        controller.egress_sync(permit, wire_operation)
+    assert called is False
+
+
+def test_revoke_waits_for_in_flight_wire_egress(tmp_path):
+    controller = ExternalRequestController(tmp_path / "requests.sqlite3")
+    permit = controller.admit_sync("model_inference", "stream")
+    wire_started = threading.Event()
+    release_wire = threading.Event()
+
+    def wire_operation():
+        wire_started.set()
+        assert release_wire.wait(timeout=2)
+        return "sent"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        egress = pool.submit(controller.egress_sync, permit, wire_operation)
+        assert wire_started.wait(timeout=2)
+        revoked = pool.submit(controller.revoke_sync)
+        assert not revoked.done()
+        release_wire.set()
+        assert egress.result(timeout=2) == "sent"
+        assert revoked.result(timeout=2) == 2
+
+
+def test_terminal_completion_is_reconciled_after_sink_recovers(tmp_path, monkeypatch):
+    journal = tmp_path / "requests.sqlite3"
+    controller = ExternalRequestController(journal)
+    permit = controller.admit_sync("model_inference", "stream")
+    original = controller._complete_once
+    sink_available = threading.Event()
+
+    def flaky_complete(candidate, terminal):
+        if not sink_available.is_set():
+            raise sqlite3.OperationalError("sink unavailable")
+        return original(candidate, terminal)
+
+    monkeypatch.setattr(controller, "_complete_once", flaky_complete)
+    assert controller.complete_sync(permit, "completed") is False
+    sink_available.set()
+
+    deadline = time.monotonic() + 2
+    state = "admitted"
+    while time.monotonic() < deadline:
+        with sqlite3.connect(journal) as connection:
+            state = connection.execute(
+                "SELECT state FROM external_request_attempts WHERE request_id = ?",
+                (permit.request_id,),
+            ).fetchone()[0]
+        if state == "completed":
+            break
+        time.sleep(0.01)
+    assert state == "completed"

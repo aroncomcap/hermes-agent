@@ -174,12 +174,11 @@ def build_keepalive_http_client(
         from hermes_cli.guarded_httpx import (
             GuardedAsyncHTTPTransport,
             GuardedHTTPTransport,
+            build_env_http_transport,
             build_origin_classifier,
         )
 
         guarded_base_url = base_url or "https://api.openai.com/v1"
-        proxy = _get_proxy_for_base_url(guarded_base_url)
-
         limits = httpx.Limits(
             max_keepalive_connections=20,
             max_connections=100,
@@ -198,8 +197,8 @@ def build_keepalive_http_client(
             allow_local_http=True,
         )
         if async_mode:
-            inner_transport = httpx.AsyncHTTPTransport(
-                verify=verify, proxy=proxy, limits=limits, retries=0
+            inner_transport = build_env_http_transport(
+                guarded_base_url, async_mode=True, verify=verify, limits=limits
             )
             transport = GuardedAsyncHTTPTransport(
                 classifier,
@@ -207,8 +206,8 @@ def build_keepalive_http_client(
                 transport=inner_transport,
             )
         else:
-            inner_transport = httpx.HTTPTransport(
-                verify=verify, proxy=proxy, limits=limits, retries=0
+            inner_transport = build_env_http_transport(
+                guarded_base_url, verify=verify, limits=limits
             )
             transport = GuardedHTTPTransport(
                 classifier,

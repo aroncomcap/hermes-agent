@@ -3418,7 +3418,11 @@ def refresh_codex_oauth_pure(
             relogin_required=True,
         )
 
-    from hermes_cli.guarded_httpx import GuardedHTTPTransport, build_origin_classifier
+    from hermes_cli.guarded_httpx import (
+        GuardedHTTPTransport,
+        build_env_http_transport,
+        build_origin_classifier,
+    )
 
     timeout = httpx.Timeout(max(5.0, float(timeout_seconds)))
     classifier = build_origin_classifier(
@@ -3430,7 +3434,7 @@ def refresh_codex_oauth_pure(
     transport = GuardedHTTPTransport(
         classifier,
         request_type="oauth_refresh",
-        transport=httpx.HTTPTransport(retries=0),
+        transport=build_env_http_transport(CODEX_OAUTH_TOKEN_URL),
     )
     with httpx.Client(
         timeout=timeout,

@@ -753,7 +753,11 @@ def build_anthropic_client(
 
     import httpx
     from httpx import Timeout
-    from hermes_cli.guarded_httpx import GuardedHTTPTransport, build_origin_classifier
+    from hermes_cli.guarded_httpx import (
+        GuardedHTTPTransport,
+        build_env_http_transport,
+        build_origin_classifier,
+    )
 
     normalized_base_url = _normalize_base_url_text(base_url)
     if normalized_base_url:
@@ -777,7 +781,7 @@ def build_anthropic_client(
         transport=GuardedHTTPTransport(
             classifier,
             request_type="model_inference",
-            transport=httpx.HTTPTransport(retries=0),
+            transport=build_env_http_transport(guarded_base_url),
         ),
         timeout=kwargs["timeout"],
         follow_redirects=False,
@@ -1030,7 +1034,11 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
     import time
     import urllib.parse
     import httpx
-    from hermes_cli.guarded_httpx import GuardedHTTPTransport, build_origin_classifier
+    from hermes_cli.guarded_httpx import (
+        GuardedHTTPTransport,
+        build_env_http_transport,
+        build_origin_classifier,
+    )
 
     if not refresh_token:
         raise ValueError("refresh_token is required")
@@ -1064,7 +1072,7 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
     transport = GuardedHTTPTransport(
         classifier,
         request_type="oauth_refresh",
-        transport=httpx.HTTPTransport(retries=0),
+        transport=build_env_http_transport(token_endpoints[0]),
     )
     last_error = None
     with httpx.Client(

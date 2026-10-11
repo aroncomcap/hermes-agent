@@ -20,6 +20,26 @@ from hermes_cli.external_request_guard import (
 DestinationClassifier = Callable[[str, httpx.URL], str]
 
 
+def build_env_http_transport(
+    base_url: str,
+    *,
+    async_mode: bool = False,
+    verify: object = True,
+    limits: httpx.Limits | None = None,
+) -> httpx.BaseTransport | httpx.AsyncBaseTransport:
+    """Build an explicit inner transport without losing proxy or CA env support."""
+    from agent.process_bootstrap import _get_proxy_for_base_url
+
+    transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
+    return transport_cls(
+        verify=verify,
+        proxy=_get_proxy_for_base_url(base_url),
+        limits=limits or httpx.Limits(),
+        retries=0,
+        trust_env=True,
+    )
+
+
 def build_origin_classifier(
     allowed_origins: Iterable[str],
     *,
@@ -205,7 +225,9 @@ class GuardedHTTPTransport(httpx.BaseTransport):
         operation = self._classifier(request.method, request.url)
         permit = self._controller.admit_sync(self._request_type, operation)
         try:
-            response = self._transport.handle_request(request)
+            response = self._controller.egress_sync(
+                permit, lambda: self._transport.handle_request(request)
+            )
             if response.is_redirect:
                 response.close()
                 raise ExternalRequestBlocked("Redirect denied before follow-up egress")
@@ -243,7 +265,9 @@ class GuardedAsyncHTTPTransport(httpx.AsyncBaseTransport):
         operation = self._classifier(request.method, request.url)
         permit = await self._controller.admit(self._request_type, operation)
         try:
-            response = await self._transport.handle_async_request(request)
+            response = await self._controller.egress(
+                permit, lambda: self._transport.handle_async_request(request)
+            )
             if response.is_redirect:
                 await response.aclose()
                 raise ExternalRequestBlocked("Redirect denied before follow-up egress")

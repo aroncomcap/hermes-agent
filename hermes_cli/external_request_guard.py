@@ -12,10 +12,12 @@ import sqlite3
 import threading
 import time
 import uuid
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 _ALLOWED_CONTEXT_KEYS = frozenset(
@@ -43,6 +45,12 @@ class ExternalRequestController:
         configured = os.environ.get("HERMES_EXTERNAL_REQUEST_JOURNAL", "")
         self._path = journal_path or Path(configured or "~/.hermes/external-requests.sqlite3").expanduser()
         self._lock = threading.Lock()
+        self._egress_gate = threading.Condition()
+        self._active_egress = 0
+        self._revoking = False
+        self._pending_lock = threading.Lock()
+        self._pending_terminal: dict[str, tuple[ExternalRequestPermit, str]] = {}
+        self._reconciler: threading.Thread | None = None
         self._initialized = False
 
     def _connect(self) -> sqlite3.Connection:
@@ -138,35 +146,130 @@ class ExternalRequestController:
             self.admit_sync, request_type, operation, **context
         )
 
-    def complete_sync(self, permit: ExternalRequestPermit, state: str) -> bool:
+    def _assert_active_locked(self, permit: ExternalRequestPermit) -> None:
+        self._initialize()
+        with self._connect() as connection:
+            generation = self._generation(connection)
+            row = connection.execute(
+                "SELECT state FROM external_request_attempts WHERE request_id = ?",
+                (permit.request_id,),
+            ).fetchone()
+        if generation != permit.generation or row != ("admitted",):
+            raise ExternalRequestBlocked("External request permit was revoked")
+
+    def _begin_egress(self, permit: ExternalRequestPermit) -> None:
+        with self._egress_gate:
+            while self._revoking:
+                self._egress_gate.wait()
+            self._active_egress += 1
+        try:
+            with self._lock:
+                self._assert_active_locked(permit)
+        except BaseException:
+            self._end_egress()
+            raise
+
+    def _end_egress(self) -> None:
+        with self._egress_gate:
+            self._active_egress -= 1
+            if self._active_egress == 0:
+                self._egress_gate.notify_all()
+
+    def egress_sync(
+        self, permit: ExternalRequestPermit, operation: Callable[[], _T]
+    ) -> _T:
+        """Run one wire operation while revocation is linearly excluded."""
+        self._begin_egress(permit)
+        try:
+            return operation()
+        finally:
+            self._end_egress()
+
+    async def egress(
+        self, permit: ExternalRequestPermit, operation: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        await asyncio.to_thread(self._begin_egress, permit)
+        try:
+            return await operation()
+        finally:
+            self._end_egress()
+
+    def _complete_once(self, permit: ExternalRequestPermit, terminal: str) -> bool:
         from hermes_cli.plugins import invoke_hook
 
+        self._initialize()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE external_request_attempts
+                   SET state = ?, terminal_at = ?
+                   WHERE request_id = ? AND state = 'admitted'""",
+                (terminal, time.time(), permit.request_id),
+            )
+        if cursor.rowcount == 1:
+            invoke_hook("post_external_request", **permit.payload, outcome=terminal)
+        return cursor.rowcount == 1
+
+    def _defer_completion(
+        self, permit: ExternalRequestPermit, terminal: str
+    ) -> None:
+        with self._pending_lock:
+            self._pending_terminal.setdefault(permit.request_id, (permit, terminal))
+            if self._reconciler is not None and self._reconciler.is_alive():
+                return
+            self._reconciler = threading.Thread(
+                target=self._reconcile_pending,
+                name="external-request-reconciler",
+                daemon=True,
+            )
+            self._reconciler.start()
+
+    def _reconcile_pending(self) -> None:
+        delay = 0.05
+        while True:
+            with self._pending_lock:
+                pending = list(self._pending_terminal.items())
+            if not pending:
+                return
+            progressed = False
+            for request_id, (permit, terminal) in pending:
+                try:
+                    reconciled = self._complete_once(permit, terminal)
+                except Exception:
+                    continue
+                if reconciled:
+                    progressed = True
+                with self._pending_lock:
+                    current = self._pending_terminal.get(request_id)
+                    if current == (permit, terminal):
+                        self._pending_terminal.pop(request_id, None)
+            if not progressed:
+                time.sleep(delay)
+                delay = min(delay * 2, 5.0)
+            else:
+                delay = 0.05
+
+    def complete_sync(self, permit: ExternalRequestPermit, state: str) -> bool:
         terminal = state if state in {"completed", "failed", "cancelled", "abandoned"} else "failed"
         try:
-            self._initialize()
-            with self._connect() as connection:
-                cursor = connection.execute(
-                    """UPDATE external_request_attempts
-                       SET state = ?, terminal_at = ?
-                       WHERE request_id = ? AND state = 'admitted'""",
-                    (terminal, time.time(), permit.request_id),
-                )
+            return self._complete_once(permit, terminal)
         except Exception:
             logger.exception(
                 "External request terminal reconciliation deferred for %s",
                 permit.request_id,
             )
+            self._defer_completion(permit, terminal)
             return False
-        if cursor.rowcount == 1:
-            invoke_hook("post_external_request", **permit.payload, outcome=terminal)
-        return cursor.rowcount == 1
 
     async def complete(self, permit: ExternalRequestPermit, state: str) -> None:
         await asyncio.to_thread(self.complete_sync, permit, state)
 
     def revoke_sync(self) -> int:
-        with self._lock:
-            try:
+        with self._egress_gate:
+            self._revoking = True
+            while self._active_egress:
+                self._egress_gate.wait()
+        try:
+            with self._lock:
                 self._initialize()
                 with self._connect() as connection:
                     generation = self._generation(connection) + 1
@@ -175,10 +278,14 @@ class ExternalRequestController:
                         (generation,),
                     )
                 return generation
-            except Exception as exc:
-                raise ExternalRequestBlocked(
-                    "External request revocation failed closed"
-                ) from exc
+        except Exception as exc:
+            raise ExternalRequestBlocked(
+                "External request revocation failed closed"
+            ) from exc
+        finally:
+            with self._egress_gate:
+                self._revoking = False
+                self._egress_gate.notify_all()
 
     async def revoke(self) -> int:
         return await asyncio.to_thread(self.revoke_sync)

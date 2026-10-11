@@ -59,7 +59,9 @@ def build_slack_client_middleware(
         permit = await active_controller.admit("slack_http", operation)
         terminal = "failed"
         try:
-            response = await handler(request)
+            response = await active_controller.egress(
+                permit, lambda: handler(request)
+            )
             await response.read()
             if 300 <= response.status < 400:
                 response.release()
@@ -107,6 +109,9 @@ class OwnedSocketModeHandler:
         self.reconnect_limit = reconnect_limit
         self._closed = asyncio.Event()
         self._socket: aiohttp.ClientWebSocketResponse | None = None
+        self._close_lock = asyncio.Lock()
+        self._dispatch_tasks: set[asyncio.Task[None]] = set()
+        self._fatal_dispatch_error: ExternalRequestBlocked | None = None
         self.client = self
 
     async def is_connected(self) -> bool:
@@ -115,26 +120,29 @@ class OwnedSocketModeHandler:
     async def start_async(self) -> None:
         failures = 0
         while not self._closed.is_set():
+            last_error: Exception | None = None
             try:
                 await self._connect_once()
-                failures = 0
             except ExternalRequestBlocked:
                 raise
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                failures += 1
-                if failures >= self.reconnect_limit:
-                    raise
-                await asyncio.sleep(min(0.25 * (2 ** min(failures, 4)), 4.0))
+            except Exception as exc:
+                last_error = exc
+            if self._closed.is_set():
+                return
+            failures += 1
+            if failures >= self.reconnect_limit:
+                raise ConnectionError("Slack Socket Mode reconnect limit reached") from last_error
+            await asyncio.sleep(min(0.25 * (2 ** min(failures, 4)), 4.0))
 
     async def close_async(self) -> None:
         self._closed.set()
         socket = self._socket
         self._socket = None
-        if socket is not None and not socket.closed:
-            async with self.controller.admission("slack_socket_control", "close"):
-                await socket.close()
+        if socket is not None:
+            await self._close_socket(socket)
+        await self._cancel_dispatches()
 
     async def revoke(self) -> int:
         generation = await self.controller.revoke()
@@ -145,33 +153,75 @@ class OwnedSocketModeHandler:
         result = await self.web_client.apps_connections_open(app_token=self.app_token)
         socket_url = result.get("url")
         classify_slack_destination("GET", socket_url)
-        async with self.session.ws_connect(
+        socket = await self.session.ws_connect(
             socket_url,
             proxy=self.proxy,
             autoping=False,
             autoclose=False,
-        ) as socket:
-            self._socket = socket
-            try:
-                await self._receive(socket)
-            finally:
-                if self._socket is socket:
-                    self._socket = None
+        )
+        self._socket = socket
+        self._fatal_dispatch_error = None
+        try:
+            await self._receive(socket)
+        finally:
+            await self._cancel_dispatches()
+            await self._close_socket(socket)
+            if self._socket is socket:
+                self._socket = None
 
     async def _receive(self, socket: aiohttp.ClientWebSocketResponse) -> None:
         async for message in socket:
             if message.type == aiohttp.WSMsgType.TEXT:
-                await self._dispatch_text(socket, message.data)
+                task = asyncio.create_task(self._dispatch_text(socket, message.data))
+                self._dispatch_tasks.add(task)
+                task.add_done_callback(self._dispatch_done)
             elif message.type == aiohttp.WSMsgType.PING:
                 payload = bytes(message.data or b"")[:125]
-                async with self.controller.admission("slack_socket_control", "pong"):
-                    await socket.pong(payload)
+                async with self.controller.admission(
+                    "slack_socket_control", "pong"
+                ) as permit:
+                    await self.controller.egress(permit, lambda: socket.pong(payload))
             elif message.type in {
                 aiohttp.WSMsgType.CLOSE,
                 aiohttp.WSMsgType.CLOSED,
                 aiohttp.WSMsgType.ERROR,
             }:
+                break
+        if self._fatal_dispatch_error is not None:
+            raise self._fatal_dispatch_error
+
+    def _dispatch_done(self, task: asyncio.Task[None]) -> None:
+        self._dispatch_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if isinstance(error, ExternalRequestBlocked):
+            self._fatal_dispatch_error = error
+            socket = self._socket
+            if socket is not None:
+                asyncio.create_task(self._close_socket(socket))
+        elif error is not None:
+            logger.error(
+                "Socket Mode dispatch failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _cancel_dispatches(self) -> None:
+        tasks = tuple(self._dispatch_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._dispatch_tasks.clear()
+
+    async def _close_socket(self, socket: aiohttp.ClientWebSocketResponse) -> None:
+        async with self._close_lock:
+            if socket.closed:
                 return
+            async with self.controller.admission(
+                "slack_socket_control", "close"
+            ) as permit:
+                await self.controller.egress(permit, socket.close)
 
     async def _dispatch_text(
         self, socket: aiohttp.ClientWebSocketResponse, raw_message: str
@@ -208,8 +258,10 @@ class OwnedSocketModeHandler:
         *,
         operation: str,
     ) -> None:
-        async with self.controller.admission("slack_socket_frame", operation):
-            await socket.send_json(payload)
+        async with self.controller.admission(
+            "slack_socket_frame", operation
+        ) as permit:
+            await self.controller.egress(permit, lambda: socket.send_json(payload))
 
     async def send_application_text(
         self,
@@ -218,8 +270,10 @@ class OwnedSocketModeHandler:
         *,
         operation: str,
     ) -> None:
-        async with self.controller.admission("slack_socket_frame", operation):
-            await socket.send_str(payload)
+        async with self.controller.admission(
+            "slack_socket_frame", operation
+        ) as permit:
+            await self.controller.egress(permit, lambda: socket.send_str(payload))
 
     async def send_application_bytes(
         self,
@@ -228,21 +282,27 @@ class OwnedSocketModeHandler:
         *,
         operation: str,
     ) -> None:
-        async with self.controller.admission("slack_socket_frame", operation):
-            await socket.send_bytes(payload)
+        async with self.controller.admission(
+            "slack_socket_frame", operation
+        ) as permit:
+            await self.controller.egress(permit, lambda: socket.send_bytes(payload))
 
     async def send_ping(
         self, socket: aiohttp.ClientWebSocketResponse, payload: bytes = b""
     ) -> None:
         if len(payload) > 125:
             raise ExternalRequestBlocked("Slack control payload denied")
-        async with self.controller.admission("slack_socket_control", "ping"):
-            await socket.ping(payload)
+        async with self.controller.admission(
+            "slack_socket_control", "ping"
+        ) as permit:
+            await self.controller.egress(permit, lambda: socket.ping(payload))
 
     async def send_pong(
         self, socket: aiohttp.ClientWebSocketResponse, payload: bytes = b""
     ) -> None:
         if len(payload) > 125:
             raise ExternalRequestBlocked("Slack control payload denied")
-        async with self.controller.admission("slack_socket_control", "pong"):
-            await socket.pong(payload)
+        async with self.controller.admission(
+            "slack_socket_control", "pong"
+        ) as permit:
+            await self.controller.egress(permit, lambda: socket.pong(payload))
