@@ -583,6 +583,20 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        from gateway.platforms.webhook_review_gate import webhook_action_allowed
+
+        if not webhook_action_allowed(route_config, payload):
+            action = payload.get("action") if isinstance(payload, dict) else None
+            logger.info(
+                "[webhook] Ignoring action %s for route %s event %s",
+                action,
+                route_name,
+                event_type,
+            )
+            return web.json_response(
+                {"status": "ignored", "event": event_type, "action": action}
+            )
+
         if not self._route_processor.route_filters_match(
             route_config, payload, event_type, request.headers
         ):
@@ -622,6 +636,23 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
             payload = transformed_payload or payload
 
+
+        if route_config.get("review_gate") and isinstance(payload, dict):
+            try:
+                from gateway.platforms.webhook_review_gate import apply_review_gate
+
+                gate_summary = await asyncio.to_thread(apply_review_gate, payload)
+            except Exception:
+                logger.warning(
+                    "[webhook] review gate failed for route %s", route_name
+                )
+                gate_summary = {
+                    "ok": False,
+                    "note": "review gate failed; no merge attempted",
+                }
+            payload = dict(payload)
+            payload["review_gate_note"] = str(gate_summary.get("note") or "")
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
@@ -634,6 +665,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # would intercept those and break the flow.
         skills = route_config.get("skills", [])
         if skills:
+            loaded_skills = []
             try:
                 from agent.skill_commands import (
                     build_skill_invocation_message,
@@ -648,14 +680,15 @@ class WebhookAdapter(BasePlatformAdapter):
                             cmd_key, user_instruction=prompt
                         )
                         if skill_content:
-                            prompt = skill_content
-                            break  # Load the first matching skill
+                            loaded_skills.append(skill_content)
                     else:
                         logger.warning(
                             "[webhook] Skill '%s' not found", skill_name
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
+            if loaded_skills:
+                prompt = "\n\n".join(loaded_skills)
 
         # Build a unique delivery ID
         delivery_id = request.headers.get(
