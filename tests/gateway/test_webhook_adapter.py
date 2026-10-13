@@ -1525,3 +1525,184 @@ class TestInsecureNoAuthSafetyRail:
             assert result is True
         finally:
             await adapter.disconnect()
+
+# Appended focused tests for the pull_request action allow-list and review gate.
+
+
+class TestActionAllowList:
+    """Optional per-route actions allow-list. Other actions are ignored."""
+
+    @pytest.mark.asyncio
+    async def test_opened_is_accepted(self):
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "actions": ["opened", "synchronize"],
+                "prompt": "PR {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "opened", "number": 1},
+                headers={
+                    "X-GitHub-Event": "pull_request",
+                    "X-GitHub-Delivery": "action-opened-1",
+                },
+            )
+            assert resp.status == 202
+            data = await resp.json()
+            assert data["status"] == "accepted"
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_synchronize_is_accepted(self):
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "actions": ["opened", "synchronize"],
+                "prompt": "PR {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "synchronize", "number": 2},
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_closed_is_ignored(self):
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "actions": ["opened", "synchronize"],
+                "prompt": "PR {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "closed", "number": 3},
+                headers={
+                    "X-GitHub-Event": "pull_request",
+                    "X-GitHub-Delivery": "action-closed-1",
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+            assert data["action"] == "closed"
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_labeled_is_ignored(self):
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "actions": ["opened", "synchronize"],
+                "prompt": "PR {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "labeled", "number": 4},
+                headers={"X-GitHub-Event": "pull_request"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ignored"
+            assert data["action"] == "labeled"
+        adapter.handle_message.assert_not_called()
+
+    def test_missing_actions_allows_any(self):
+        from gateway.platforms.webhook_review_gate import webhook_action_allowed
+
+        assert webhook_action_allowed({"events": ["pull_request"]}, {"action": "closed"})
+        assert webhook_action_allowed(
+            {"actions": ["opened", "synchronize"]}, {"action": "opened"}
+        )
+        assert not webhook_action_allowed(
+            {"actions": ["opened", "synchronize"]}, {"action": "closed"}
+        )
+
+
+class TestReviewGateCards:
+    """Review gate creates cards and does not merge."""
+
+    def test_opened_spawns_one_reviewer_and_does_not_merge(self):
+        from gateway.platforms.webhook_review_gate import apply_review_gate
+
+        calls = []
+        ids = iter(["impl123", "rev456"])
+
+        def run(argv):
+            calls.append(list(argv))
+            if "create" in argv:
+                return 0, json.dumps({"id": next(ids)}), ""
+            if argv[:3] == ["systemctl", "--user", "show"]:
+                return 0, "not-found\n", ""
+            return 0, "", ""
+
+        payload = {
+            "action": "opened",
+            "number": 12,
+            "repository": {"full_name": "acme/widgets"},
+            "pull_request": {
+                "html_url": "https://example.invalid/acme/widgets/pull/12",
+                "head": {"sha": "abc123def456"},
+            },
+        }
+        summary = apply_review_gate(payload, run=run)
+        assert summary["ok"] is True
+        assert summary["merged"] is False
+        assert summary["implementer_id"] == "impl123"
+        assert summary["reviewer_id"] == "rev456"
+        assert summary["alert_scheduled"] is True
+        block = [c for c in calls if len(c) > 3 and c[2] == "block"]
+        assert len(block) == 1
+        assert block[0][-1].startswith("review-required:")
+        reviewer = [c for c in calls if "create" in c and c[-1].endswith("reviewer abc123d")]
+        assert len(reviewer) == 1
+        assert reviewer[0].count("--skill") == 2
+        assert "github-code-review" in reviewer[0]
+        assert "requesting-code-review" in reviewer[0]
+        assert "--parent" not in reviewer[0]
+        assert reviewer[0][reviewer[0].index("--assignee") + 1] == "default"
+        assert any(c[0] == "systemd-run" and "--on-active=10min" in c for c in calls)
+        for argv in calls:
+            assert argv[0] != "gh"
+            assert "merge" not in argv[0]
+            if len(argv) > 2 and argv[1] == "kanban":
+                assert argv[2] in {"create", "block", "comment"}
+            assert not any(arg == "--approve" or arg == "approve" for arg in argv[1:])
+        before = len(calls)
+        closed = apply_review_gate(
+            {"action": "closed", "number": 12, "repository": {"full_name": "acme/widgets"}},
+            run=run,
+        )
+        labeled = apply_review_gate(
+            {"action": "labeled", "number": 12, "repository": {"full_name": "acme/widgets"}},
+            run=run,
+        )
+        assert closed["ok"] is False
+        assert labeled["ok"] is False
+        assert len(calls) == before
